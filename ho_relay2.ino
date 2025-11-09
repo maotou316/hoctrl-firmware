@@ -398,14 +398,23 @@ const char* getDeviceId() {
 }
 
 void pulseRelay() {
+  Serial.println("═══ 觸發繼電器 ═══");
+  Serial.printf("繼電器腳位: GPIO %d\n", relayButton);
+
+  Serial.println("→ 繼電器 ON");
   digitalWrite(relayButton, HIGH);
   digitalWrite(ledOnFace, HIGH);
   digitalWrite(ledOnBoard, HIGH);
+
   delay(1000);
+
+  Serial.println("→ 繼電器 OFF");
   digitalWrite(relayButton, LOW);
   digitalWrite(ledOnFace, LOW);
   digitalWrite(ledOnBoard, LOW);
-  
+
+  Serial.println("✓ 繼電器觸發完成");
+
   // 使用 JSON 格式發布狀態
   publishStatus();
 }
@@ -416,16 +425,27 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   for (int i = 0; i < length; i++) {
     message += (char)payload[i];
   }
-  
-  Serial.print("收到訊息 [");
-  Serial.print(topic);
-  Serial.print("] ");
-  Serial.println(message);
 
-  if (String(topic) == String("hoban/" + deviceId + "/control")) {
+  Serial.println("═══ MQTT 訊息 ═══");
+  Serial.print("主題: ");
+  Serial.println(topic);
+  Serial.print("內容: ");
+  Serial.println(message);
+  Serial.print("長度: ");
+  Serial.println(length);
+
+  String expectedTopic = String("hoban/") + deviceId + "/control";
+  Serial.print("預期主題: ");
+  Serial.println(expectedTopic);
+
+  if (String(topic) == expectedTopic) {
+    Serial.println("✓ 主題匹配，處理指令...");
+
     if (message == "status") {
+      Serial.println("→ 執行：發布狀態");
       publishStatus();  // 使用 JSON 格式發布狀態
     } else if (message == "ON") {
+      Serial.println("→ 執行：觸發繼電器");
       pulseRelay();
     } else if (message == "reset") {
       Serial.println("收到重置命令，執行重置...");
@@ -456,8 +476,14 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
           startFirmwareUpdate(downloadUrl);
         }
       }
+    } else {
+      Serial.print("→ 未知指令: ");
+      Serial.println(message);
     }
+  } else {
+    Serial.println("✗ 主題不匹配，忽略訊息");
   }
+  Serial.println("═══════════════");
 }
 
 
@@ -1018,7 +1044,10 @@ bool quickConnectDefault() {
 
       // 訂閱控制主題
       String controlTopic = String("hoban/") + deviceId + "/control";
-      mqttClient.subscribe(controlTopic.c_str());
+      bool subscribeSuccess = mqttClient.subscribe(controlTopic.c_str());
+      Serial.printf("訂閱控制主題: %s - %s\n",
+                    controlTopic.c_str(),
+                    subscribeSuccess ? "成功" : "失敗");
 
       // 發布上線狀態（包含伺服器資訊）
       publishStatusWithServer(DEFAULT_MQTT_SERVER);
@@ -1076,7 +1105,10 @@ bool quickConnectCustom() {
 
       // 訂閱控制主題
       String controlTopic = String("hoban/") + deviceId + "/control";
-      mqttClient.subscribe(controlTopic.c_str());
+      bool subscribeSuccess = mqttClient.subscribe(controlTopic.c_str());
+      Serial.printf("訂閱控制主題: %s - %s\n",
+                    controlTopic.c_str(),
+                    subscribeSuccess ? "成功" : "失敗");
 
       // 發布上線狀態（包含伺服器資訊）
       publishStatusWithServer(mqttServer);
