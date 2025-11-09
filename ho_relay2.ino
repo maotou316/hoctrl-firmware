@@ -31,13 +31,12 @@ BLECharacteristic *pCharacteristic = NULL;
 bool deviceConnected = false;
 
 
-const char* firmwareVersion = "1.3.0"; // 當前韌體版本
+const char* firmwareVersion = "1.3.2"; // 當前韌體版本
 const char* deviceModel = "hoRelay2"; // 設備型號
 
 // ESP32-C3 GPIO 定義
 const int bootButton = 9;     // BOOT 按鈕在 GPIO 9
 const int resetButton = 1;        // 
-
 
 const int ledOnBoard = 3;    // 第二個按鈕在 GPIO 8
 const int ledOnFace = 0;        // 
@@ -526,12 +525,22 @@ void setup()
   const char* deviceId = getDeviceId();  // 獲取設備 ID
 
   // 配置 WiFi 設定以提高穩定性
-  WiFi.persistent(false);  // 不將 WiFi 配置寫入 Flash（減少寫入次數）
-  WiFi.setAutoReconnect(true);  // 啟用自動重連
-  WiFi.setSleep(false);  // 禁用 WiFi 睡眠模式（提高穩定性）
+  Serial.println("=== 初始化 WiFi 設定 ===");
+  WiFi.persistent(false);        // 不將 WiFi 配置寫入 Flash（減少寫入次數，延長壽命）
+  WiFi.setAutoReconnect(true);   // 啟用自動重連（ESP32 底層會嘗試重連）
+  WiFi.setSleep(false);          // 禁用 WiFi 睡眠模式（提高穩定性，避免斷線）
+
+  // 設定 WiFi 電源模式為最大性能（犧牲一點耗電換取穩定性）
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);  // 設定最大發射功率
+
+  Serial.printf("WiFi 模式: STA (Station)\n");
+  Serial.printf("自動重連: 啟用\n");
+  Serial.printf("睡眠模式: 禁用\n");
+  Serial.printf("發射功率: 19.5dBm (最大)\n");
 
   if (strlen(ssid) > 0) {
     Serial.println("SSID: " + String(ssid));
+    Serial.println("開始連接 WiFi...");
     connectToWiFi();
     
     // 只有在成功連接到 WiFi 時才使用智慧連接
@@ -627,25 +636,90 @@ void loop()
   static unsigned long lastKeepAlive = 0;
   static int reconnectFailCount = 0;
   static int wifiFailCount = 0;
+  static unsigned long wifiConnectedTime = 0;  // 記錄連接成功的時間
   unsigned long now = millis();
 
-  // 檢查 WiFi 連線狀態（每 10 秒檢查一次，降低檢查頻率）
-  if (now - lastWiFiCheck > 10000) {
+  // 檢查 WiFi 連線狀態（縮短檢查間隔到 5 秒）
+  if (now - lastWiFiCheck > 5000) {
     lastWiFiCheck = now;
-    
+
     if (WiFi.status() != WL_CONNECTED && strlen(ssid) > 0) {
       wifiFailCount++;
-      Serial.printf("WiFi 連接中斷（第 %d 次），嘗試重新連接...\n", wifiFailCount);
-      connectToWiFi();
-      
-      // 如果連接成功，重置失敗計數
-      if (WiFi.status() == WL_CONNECTED) {
-        wifiFailCount = 0;
-        Serial.println("WiFi 重新連接成功！");
+
+      // 如果是第一次斷線，記錄診斷資訊
+      if (wifiFailCount == 1) {
+        Serial.println("═══ WiFi 連接中斷 ═══");
+        Serial.printf("斷線時間: %lu ms\n", now);
+        if (wifiConnectedTime > 0) {
+          Serial.printf("已連接時長: %lu 秒\n", (now - wifiConnectedTime) / 1000);
+        }
       }
-    } else if (WiFi.status() == WL_CONNECTED && wifiFailCount > 0) {
-      // 連接恢復，重置計數
-      wifiFailCount = 0;
+
+      Serial.printf("WiFi 重連嘗試 #%d...\n", wifiFailCount);
+
+      // 根據失敗次數採用不同策略
+      if (wifiFailCount <= 3) {
+        // 前 3 次：快速重連
+        Serial.println("策略：快速重連");
+        connectToWiFi();
+      } else if (wifiFailCount <= 6) {
+        // 第 4-6 次：重置 WiFi 模組後重連
+        Serial.println("策略：重置 WiFi 模組後重連");
+        WiFi.disconnect(true);
+        delay(1000);
+        WiFi.mode(WIFI_OFF);
+        delay(1000);
+        WiFi.mode(WIFI_STA);
+        delay(1000);
+        connectToWiFi();
+      } else {
+        // 第 7 次以上：完整重啟 WiFi（但不重啟設備）
+        Serial.println("策略：完整重啟 WiFi 子系統");
+        WiFi.disconnect(true);
+        delay(2000);
+        WiFi.mode(WIFI_OFF);
+        delay(2000);
+        WiFi.mode(WIFI_STA);
+        WiFi.setAutoReconnect(true);
+        WiFi.setSleep(false);
+        delay(1000);
+        connectToWiFi();
+
+        // 如果超過 10 次仍失敗，重置計數避免無限重試
+        if (wifiFailCount > 10) {
+          Serial.println("⚠ 重連失敗次數過多，暫停重試 30 秒");
+          wifiFailCount = 0;
+          lastWiFiCheck = now + 25000;  // 延遲到 30 秒後再檢查
+        }
+      }
+
+      // 如果連接成功，重置失敗計數並記錄時間
+      if (WiFi.status() == WL_CONNECTED) {
+        Serial.printf("✓ WiFi 重新連接成功！(嘗試 %d 次)\n", wifiFailCount);
+        Serial.printf("訊號強度: %d dBm\n", WiFi.RSSI());
+        wifiFailCount = 0;
+        wifiConnectedTime = now;
+      }
+    } else if (WiFi.status() == WL_CONNECTED) {
+      // WiFi 已連接
+      if (wifiFailCount > 0) {
+        // 剛恢復連接
+        Serial.println("✓ WiFi 連接已恢復");
+        wifiFailCount = 0;
+      }
+
+      // 如果是第一次記錄，保存連接時間
+      if (wifiConnectedTime == 0) {
+        wifiConnectedTime = now;
+      }
+
+      // 定期印出 WiFi 狀態（每分鐘）
+      static unsigned long lastStatusPrint = 0;
+      if (now - lastStatusPrint > 60000) {
+        lastStatusPrint = now;
+        Serial.printf("ℹ WiFi 狀態: 已連接 %lu 秒，訊號 %d dBm\n",
+                     (now - wifiConnectedTime) / 1000, WiFi.RSSI());
+      }
     }
   }
 
@@ -688,50 +762,100 @@ void loop()
 }
 
 void connectToWiFi() {
-  // 先斷開現有連接
-  WiFi.disconnect(true);
-  delay(100);
-  
+  // 檢查當前狀態
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("WiFi 已連接，跳過重連");
+    return;
+  }
+
+  // 溫和地斷開連接（不清除配置）
+  if (WiFi.status() != WL_DISCONNECTED) {
+    WiFi.disconnect(false);  // false = 不清除 WiFi 配置
+    delay(100);
+  }
+
   // 設置為 STA 模式
   WiFi.mode(WIFI_STA);
-  
+
   // 開始連接
-  Serial.printf("正在連接 WiFi: %s", ssid);
+  Serial.printf("正在連接 WiFi: %s\n", ssid);
   WiFi.begin(ssid, password);
 
   int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 30) {  // 增加到 30 次（15 秒）
+  const int maxAttempts = 60;  // 增加到 60 次（30 秒）
+
+  while (WiFi.status() != WL_CONNECTED && attempts < maxAttempts) {
     blinkLED();  // 連接過程中持續閃爍 LED
-    delay(50);   // 短延遲讓 LED 有時間更新
-    
-    // 每 500ms 印出一個點
-    if (attempts % 10 == 0) {
+    delay(500);  // 增加到 500ms，給 WiFi 更多時間
+
+    // 每 2 秒印出一個點和當前狀態
+    if (attempts % 4 == 0) {
       Serial.print(".");
+
+      // 印出詳細狀態碼（用於診斷）
+      if (attempts % 20 == 0 && attempts > 0) {
+        wl_status_t status = WiFi.status();
+        Serial.printf("\n狀態碼: %d ", status);
+        switch(status) {
+          case WL_IDLE_STATUS: Serial.print("(閒置)"); break;
+          case WL_NO_SSID_AVAIL: Serial.print("(找不到SSID)"); break;
+          case WL_SCAN_COMPLETED: Serial.print("(掃描完成)"); break;
+          case WL_CONNECT_FAILED: Serial.print("(連接失敗)"); break;
+          case WL_CONNECTION_LOST: Serial.print("(連接中斷)"); break;
+          case WL_DISCONNECTED: Serial.print("(已斷線)"); break;
+        }
+        Serial.println();
+      }
     }
     attempts++;
   }
 
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nWiFi 連接成功！");
+    Serial.println("\n✓ WiFi 連接成功！");
     Serial.print("IP 位址: ");
     Serial.println(WiFi.localIP());
     Serial.print("訊號強度: ");
     Serial.print(WiFi.RSSI());
     Serial.println(" dBm");
-    
+    Serial.print("MAC 位址: ");
+    Serial.println(WiFi.macAddress());
+
     // WiFi 連接成功後發布狀態
     if (mqttClient.connected()) {
       publishStatus();
     }
   } else {
-    Serial.println("\n無法連接到 WiFi");
+    Serial.println("\n✗ 無法連接到 WiFi");
     Serial.printf("最後狀態碼: %d\n", WiFi.status());
-    Serial.println("可能原因：");
-    Serial.println("1. SSID 或密碼錯誤");
-    Serial.println("2. 訊號太弱");
-    Serial.println("3. 路由器限制連接數");
-    Serial.println("4. WiFi 頻段不支援（僅支援 2.4GHz）");
-    Serial.println("將於 5 秒後重試...");
+
+    wl_status_t finalStatus = WiFi.status();
+    Serial.println("診斷資訊：");
+
+    switch(finalStatus) {
+      case WL_NO_SSID_AVAIL:
+        Serial.println("❌ 找不到指定的 SSID");
+        Serial.println("  → 請確認 SSID 名稱正確");
+        Serial.println("  → 確認路由器已開啟且在訊號範圍內");
+        break;
+      case WL_CONNECT_FAILED:
+        Serial.println("❌ 連接失敗（可能是密碼錯誤）");
+        Serial.println("  → 請檢查 WiFi 密碼");
+        Serial.println("  → 確認使用 2.4GHz 頻段（不支援 5GHz）");
+        break;
+      case WL_CONNECTION_LOST:
+        Serial.println("❌ 連接中斷");
+        Serial.println("  → 訊號可能太弱");
+        Serial.println("  → 路由器可能不穩定");
+        break;
+      default:
+        Serial.println("其他可能原因：");
+        Serial.println("1. SSID 或密碼錯誤");
+        Serial.println("2. 訊號太弱（嘗試靠近路由器）");
+        Serial.println("3. 路由器限制連接數（嘗試重啟路由器）");
+        Serial.println("4. WiFi 頻段不支援（僅支援 2.4GHz）");
+        Serial.println("5. MAC 過濾已啟用（請將設備加入白名單）");
+        break;
+    }
   }
 }
 
