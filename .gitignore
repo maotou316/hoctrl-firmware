@@ -1,0 +1,3 @@
+build/
+serviceAccountKey.json
+.theia/
