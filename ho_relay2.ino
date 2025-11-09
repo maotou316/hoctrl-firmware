@@ -31,7 +31,7 @@ BLECharacteristic *pCharacteristic = NULL;
 bool deviceConnected = false;
 
 
-const char* firmwareVersion = "1.3.2"; // 當前韌體版本
+const char* firmwareVersion = "1.3.5"; // 當前韌體版本
 const char* deviceModel = "hoRelay2"; // 設備型號
 
 // ESP32-C3 GPIO 定義
@@ -397,16 +397,46 @@ const char* getDeviceId() {
   return deviceIdString.c_str();
 }
 
-void pulseRelay() {
-  Serial.println("═══ 觸發繼電器 ═══");
+// 打開繼電器和燈（不自動關閉）
+void relayOn() {
+  Serial.println("═══ 繼電器 ON ═══");
   Serial.printf("繼電器腳位: GPIO %d\n", relayButton);
 
-  Serial.println("→ 繼電器 ON");
   digitalWrite(relayButton, HIGH);
   digitalWrite(ledOnFace, HIGH);
   digitalWrite(ledOnBoard, HIGH);
 
-  delay(1000);
+  Serial.println("✓ 繼電器已開啟（長亮狀態）");
+
+  // 使用 JSON 格式發布狀態
+  publishStatus();
+}
+
+// 關閉繼電器和燈
+void relayOff() {
+  Serial.println("═══ 繼電器 OFF ═══");
+
+  digitalWrite(relayButton, LOW);
+  digitalWrite(ledOnFace, LOW);
+  digitalWrite(ledOnBoard, LOW);
+
+  Serial.println("✓ 繼電器已關閉");
+
+  // 使用 JSON 格式發布狀態
+  publishStatus();
+}
+
+// 保留舊的 pulseRelay 函數以向後相容（如果有其他地方使用）
+void pulseRelay() {
+  Serial.println("═══ 觸發繼電器 ═══");
+  Serial.printf("繼電器腳位: GPIO %d\n", relayButton);
+
+  Serial.println("→ 繼電器 ON（長亮）");
+  digitalWrite(relayButton, HIGH);
+  digitalWrite(ledOnFace, HIGH);
+  digitalWrite(ledOnBoard, HIGH);
+
+  delay(2000);  // 改為 2 秒長亮
 
   Serial.println("→ 繼電器 OFF");
   digitalWrite(relayButton, LOW);
@@ -445,8 +475,11 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       Serial.println("→ 執行：發布狀態");
       publishStatus();  // 使用 JSON 格式發布狀態
     } else if (message == "ON") {
-      Serial.println("→ 執行：觸發繼電器");
-      pulseRelay();
+      Serial.println("→ 執行：打開繼電器（長亮）");
+      relayOn();
+    } else if (message == "OFF") {
+      Serial.println("→ 執行：關閉繼電器");
+      relayOff();
     } else if (message == "reset") {
       Serial.println("收到重置命令，執行重置...");
       clearWiFiConfig();  // 清除 WiFi 設定並重啟
@@ -1186,11 +1219,12 @@ void startFirmwareUpdate(const char* downloadUrl) {
   Serial.printf("下載網址：%s\n", downloadUrl);
   Serial.printf("可用空間：%u bytes\n", ESP.getFreeSketchSpace());
   Serial.printf("當前韌體版本：%s\n", firmwareVersion);
-  
+
   isUpdating = true;
   updateProgress = 0;
-  digitalWrite(ledOnFace, HIGH);
-  digitalWrite(ledOnBoard, HIGH);
+  // LED 開始快閃（更新模式）
+  digitalWrite(ledOnFace, LOW);
+  digitalWrite(ledOnBoard, LOW);
   
   // 發送更新開始狀態到 MQTT
   if (mqttClient.connected()) {
@@ -1257,12 +1291,14 @@ void startFirmwareUpdate(const char* downloadUrl) {
         WiFiClient* stream = http.getStreamPtr();
         size_t written = 0;
         uint8_t buff[1024] = { 0 };
-        
+
         // 下載超時設定
         const unsigned long downloadTimeout = 300000; // 5 分鐘
         unsigned long startTime = millis();
         unsigned long lastProgressTime = startTime;
-        
+        unsigned long lastBlinkTime = startTime;
+        bool ledBlinkState = false;
+
         while (http.connected() && (written < contentLength)) {
           size_t available = stream->available();
           if (available) {
@@ -1271,20 +1307,28 @@ void startFirmwareUpdate(const char* downloadUrl) {
             if (bytesWritten > 0) {
               written += bytesWritten;
               updateProgress = (written * 100) / contentLength;
-              
+
               if (millis() - lastProgressTime >= 1000) {
                 Serial.printf("下載進度：%d%%（%u/%d bytes）\n", updateProgress, written, contentLength);
                 lastProgressTime = millis();
               }
             }
           }
-          
+
+          // LED 快閃 (每 QUICK_BLINK 毫秒切換一次)
+          if (millis() - lastBlinkTime >= QUICK_BLINK) {
+            ledBlinkState = !ledBlinkState;
+            digitalWrite(ledOnFace, ledBlinkState ? HIGH : LOW);
+            digitalWrite(ledOnBoard, ledBlinkState ? HIGH : LOW);
+            lastBlinkTime = millis();
+          }
+
           // 檢查超時
           if (millis() - startTime > downloadTimeout) {
             Serial.println("錯誤：下載超時");
             break;
           }
-          
+
           delay(1); // 避免看門狗重置
         }
         

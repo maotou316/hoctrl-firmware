@@ -98,36 +98,73 @@ def check_requirements():
     
     return all_installed
 
+def increment_version(version):
+    """將版本號加 1 (遞增最後一位)"""
+    try:
+        parts = version.split('.')
+        if len(parts) >= 1:
+            # 遞增最後一位數字
+            parts[-1] = str(int(parts[-1]) + 1)
+            return '.'.join(parts)
+        return version
+    except Exception as e:
+        print_color(f"⚠ 版本號遞增失敗: {e}", Colors.YELLOW)
+        return version
+
+def update_firmware_version(new_version):
+    """更新 .ino 檔案中的版本號"""
+    ino_file = "ho_relay2.ino"
+
+    try:
+        with open(ino_file, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        # 替換版本號
+        new_content = re.sub(
+            r'const char\* firmwareVersion = "[^"]+"',
+            f'const char* firmwareVersion = "{new_version}"',
+            content
+        )
+
+        with open(ino_file, 'w', encoding='utf-8') as f:
+            f.write(new_content)
+
+        print_color(f"✓ 版本號已更新為: {new_version}", Colors.GREEN)
+        return True
+    except Exception as e:
+        print_color(f"❌ 更新版本號失敗: {e}", Colors.RED)
+        return False
+
 def get_firmware_info():
     """從 .ino 檔案讀取韌體資訊"""
     print_header("讀取韌體資訊")
-    
+
     ino_file = "ho_relay2.ino"
     if not os.path.exists(ino_file):
         print_color(f"❌ 找不到 {ino_file}", Colors.RED)
         return None
-    
+
     try:
         with open(ino_file, 'r', encoding='utf-8') as f:
             content = f.read()
-        
+
         # 提取版本號
         version_match = re.search(r'const char\* firmwareVersion = "([^"]+)"', content)
         if not version_match:
             print_color("❌ 無法從 .ino 檔案讀取版本號", Colors.RED)
             return None
         version = version_match.group(1)
-        
+
         # 提取設備型號
         model_match = re.search(r'const char\* deviceModel = "([^"]+)"', content)
         if not model_match:
             print_color("❌ 無法從 .ino 檔案讀取設備型號", Colors.RED)
             return None
         model = model_match.group(1)
-        
+
         print_color(f"設備型號: {model}", Colors.WHITE)
         print_color(f"韌體版本: {version}", Colors.WHITE)
-        
+
         return {
             'version': version,
             'model': model
@@ -542,9 +579,20 @@ def main():
     if not firmware_info:
         print_color("\n❌ 無法讀取韌體資訊", Colors.RED)
         sys.exit(1)
-    
+
     version = firmware_info['version']
     model = firmware_info['model']
+
+    # 自動將版本號加 1
+    print_header("遞增版本號")
+    old_version = version
+    version = increment_version(version)
+    print_color(f"舊版本: {old_version}", Colors.GRAY)
+    print_color(f"新版本: {version}", Colors.GREEN)
+
+    if not update_firmware_version(version):
+        print_color("\n❌ 無法更新版本號", Colors.RED)
+        sys.exit(1)
     
     # 確認更新資訊
     print_header("確認更新資訊")
