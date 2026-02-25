@@ -31,7 +31,7 @@ BLECharacteristic *pCharacteristic = NULL;
 bool deviceConnected = false;
 
 
-const char* firmwareVersion = "1.3.5"; // 當前韌體版本
+const char* firmwareVersion = "1.3.11"; // 當前韌體版本
 const char* deviceModel = "hoRelay2"; // 設備型號
 
 // ESP32-C3 GPIO 定義
@@ -585,6 +585,7 @@ void setup()
 
   // 配置 WiFi 設定以提高穩定性
   Serial.println("=== 初始化 WiFi 設定 ===");
+  WiFi.mode(WIFI_STA);           // 先設定模式（ESP32-C3 必須先設定模式再做其他配置）
   WiFi.persistent(false);        // 不將 WiFi 配置寫入 Flash（減少寫入次數，延長壽命）
   WiFi.setAutoReconnect(true);   // 啟用自動重連（ESP32 底層會嘗試重連）
   WiFi.setSleep(false);          // 禁用 WiFi 睡眠模式（提高穩定性，避免斷線）
@@ -827,17 +828,55 @@ void connectToWiFi() {
     return;
   }
 
-  // 溫和地斷開連接（不清除配置）
-  if (WiFi.status() != WL_DISCONNECTED) {
-    WiFi.disconnect(false);  // false = 不清除 WiFi 配置
-    delay(100);
-  }
-
-  // 設置為 STA 模式
+  // 徹底重置 WiFi 狀態（ESP32-C3 需要完整重置才能可靠連線）
+  WiFi.disconnect(true);  // true = 清除之前的 AP 配置
+  delay(200);
+  WiFi.mode(WIFI_OFF);
+  delay(200);
   WiFi.mode(WIFI_STA);
+  delay(200);
+
+  // 先掃描確認目標 SSID 是否存在，並取得加密類型
+  Serial.println("掃描附近 WiFi 網路...");
+  int n = WiFi.scanNetworks();
+  bool ssidFound = false;
+  wifi_auth_mode_t authMode = WIFI_AUTH_WPA2_PSK;
+  int8_t targetRSSI = -100;
+  for (int i = 0; i < n; i++) {
+    Serial.printf("  [%d] %s (%d dBm) 加密: %d ch: %d\n", i,
+                  WiFi.SSID(i).c_str(), WiFi.RSSI(i),
+                  WiFi.encryptionType(i), WiFi.channel(i));
+    if (WiFi.SSID(i) == String(ssid)) {
+      ssidFound = true;
+      authMode = WiFi.encryptionType(i);
+      targetRSSI = WiFi.RSSI(i);
+    }
+  }
+  if (!ssidFound) {
+    Serial.printf("⚠ 掃描結果中找不到 SSID: %s\n", ssid);
+    Serial.println("  → 請確認路由器已開啟且在 2.4GHz 頻段");
+  } else {
+    Serial.printf("✓ 找到目標 SSID: %s (RSSI: %d dBm, 加密類型: %d)\n", ssid, targetRSSI, authMode);
+    // 顯示加密類型名稱
+    switch(authMode) {
+      case WIFI_AUTH_OPEN: Serial.println("  加密: 開放(無加密)"); break;
+      case WIFI_AUTH_WEP: Serial.println("  加密: WEP"); break;
+      case WIFI_AUTH_WPA_PSK: Serial.println("  加密: WPA-PSK"); break;
+      case WIFI_AUTH_WPA2_PSK: Serial.println("  加密: WPA2-PSK"); break;
+      case WIFI_AUTH_WPA_WPA2_PSK: Serial.println("  加密: WPA/WPA2-PSK"); break;
+      case WIFI_AUTH_WPA3_PSK: Serial.println("  加密: WPA3-PSK"); break;
+      case WIFI_AUTH_WPA2_WPA3_PSK: Serial.println("  加密: WPA2/WPA3-PSK"); break;
+      default: Serial.printf("  加密: 未知(%d)\n", authMode); break;
+    }
+  }
+  WiFi.scanDelete();
+
+  // 掃描後重新設定 STA 模式
+  WiFi.mode(WIFI_STA);
+  delay(100);
 
   // 開始連接
-  Serial.printf("正在連接 WiFi: %s\n", ssid);
+  Serial.printf("正在連接 WiFi: %s (密碼長度: %d)\n", ssid, strlen(password));
   WiFi.begin(ssid, password);
 
   int attempts = 0;
