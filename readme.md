@@ -1,3 +1,18 @@
-# HoCtrl Firmware Releases
-
-Firmware releases for HoCtrl devices.
+### hoRelay2
+- **開發板**: ESP32-C3 Dev Module
+- **特色**: 無聲繼電器
+- **韌體版本**: 1.2.1
+- **GPIO 定義**:
+  - BOOT 按鈕: GPIO 9
+  - RESET 按鈕: GPIO 1
+  - 板載 LED: GPIO 3
+  - 面板 LED: GPIO 0
+  - 繼電器按鈕: GPIO 4
+- **開發板設定**:
+  - USB CDC On Boot: Enabled
+  - CPU Frequency: 160MHz (WiFi)
+  - Flash Size: 4MB (32Mb)
+  - Partition Scheme: Custom (使用 partitions.csv)
+  - Upload Speed: 921600
+  - Flash Mode: DIO
+  - Erase All Flash Before Sketch Upload：Enabled
