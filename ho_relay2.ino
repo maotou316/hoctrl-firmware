@@ -12,7 +12,7 @@
 #include <WiFiClientSecure.h>  // 添加 WiFiClientSecure 庫
 #include <esp_wifi.h>          // ESP32 WiFi 底層 API（PMF 設定等）
 
-const char* firmwareVersion = "1.4.6"; // 當前韌體版本
+const char* firmwareVersion = "1.5.1"; // 當前韌體版本
 // uPesy ESP32 WROOM DevKit
 // LED 閃爍模式定義
 const unsigned long SHORT_BLINK = 200;  // 短閃持續時間 (毫秒)
@@ -84,11 +84,23 @@ char mqttUsername[16] = "";
 char mqttPassword[16] = "";
 int mqttPort = 1883;
 
-// 預設 MQTT 伺服器配置
-const char* DEFAULT_MQTT_SERVER = "mqttgo.io";
-const int DEFAULT_MQTT_PORT = 1883;
-const char* DEFAULT_MQTT_USERNAME = NULL;
-const char* DEFAULT_MQTT_PASSWORD = NULL;
+// 預設 MQTT 伺服器清單（與 Flutter App 一致）
+struct MqttServerConfig {
+  const char* server;
+  int port;
+  const char* username;
+  const char* password;
+};
+
+const MqttServerConfig DEFAULT_SERVERS[] = {
+  {"mqttgo.io",               1883, NULL,         NULL},
+  {"broker.hoban.tw",         1883, "hoban_user", "hoban_pass"},
+  {"mqtt.eclipseprojects.io", 1883, NULL,         NULL},
+  {"broker.emqx.io",          1883, NULL,         NULL},
+  {"broker.hivemq.com",       1883, NULL,         NULL},
+};
+const int DEFAULT_SERVER_COUNT = sizeof(DEFAULT_SERVERS) / sizeof(DEFAULT_SERVERS[0]);
+int currentServerIndex = 0;  // 當前連接的預設伺服器索引
 
 bool useCustomServer = false;       // 是否使用自訂伺服器
 
@@ -489,7 +501,7 @@ void pulseRelay() {
   Serial.println("═══ 觸發繼電器 ═══");
   Serial.printf("繼電器腳位: GPIO %d\n", relayButton);
 
-  Serial.println("→ 繼電器 ON（長亮）");
+  Serial.println("→ 繼電器 ON（點動）");
   digitalWrite(relayButton, HIGH);
   digitalWrite(ledOnFace, HIGH);
   digitalWrite(ledOnBoard, HIGH);
@@ -533,8 +545,8 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       Serial.println("→ 執行：發布狀態");
       publishStatus();  // 使用 JSON 格式發布狀態
     } else if (message == "ON") {
-      Serial.println("→ 執行：打開繼電器（長亮）");
-      relayOn();
+      Serial.println("→ 執行：打開繼電器（點動）");
+      pulseRelay();
     } else if (message == "OFF") {
       Serial.println("→ 執行：關閉繼電器");
       relayOff();
@@ -872,7 +884,7 @@ void loop()
       // 每 3 秒發送一次保持連線的狀態更新（帶伺服器資訊）
       if (now - lastKeepAlive > 3000) {
         const char* server = useCustomServer && strlen(mqttServer) > 0 ?
-                             mqttServer : DEFAULT_MQTT_SERVER;
+                             mqttServer : DEFAULT_SERVERS[currentServerIndex].server;
         publishStatusWithServer(server);
         lastKeepAlive = now;
       }
@@ -1206,11 +1218,14 @@ void publishServerChangeEvent(const char* switchType, const char* server) {
   Serial.printf("已發布伺服器切換事件: %s (%s)\n", server, switchType);
 }
 
-// 快速連接預設伺服器
-bool quickConnectDefault() {
-  Serial.printf("快速測試預設伺服器: %s:%d ... ", DEFAULT_MQTT_SERVER, DEFAULT_MQTT_PORT);
+// 快速連接指定索引的預設伺服器
+bool quickConnectToIndex(int index) {
+  if (index < 0 || index >= DEFAULT_SERVER_COUNT) return false;
 
-  mqttClient.setServer(DEFAULT_MQTT_SERVER, DEFAULT_MQTT_PORT);
+  const MqttServerConfig& cfg = DEFAULT_SERVERS[index];
+  Serial.printf("快速測試預設伺服器 [%d]: %s:%d ... ", index, cfg.server, cfg.port);
+
+  mqttClient.setServer(cfg.server, cfg.port);
   mqttClient.setCallback(mqttCallback);
   mqttClient.setKeepAlive(30);
 
@@ -1222,7 +1237,7 @@ bool quickConnectDefault() {
   StaticJsonDocument<128> offlineDoc;
   offlineDoc["device_id"] = deviceId;
   offlineDoc["status"] = "offline";
-  offlineDoc["server"] = DEFAULT_MQTT_SERVER;
+  offlineDoc["server"] = cfg.server;
   offlineDoc["timestamp"] = millis() / 1000;
 
   char offlineBuffer[128];
@@ -1230,8 +1245,8 @@ bool quickConnectDefault() {
 
   // 嘗試連接（1秒超時）
   if (mqttClient.connect(deviceId,
-                        DEFAULT_MQTT_USERNAME,
-                        DEFAULT_MQTT_PASSWORD,
+                        cfg.username,
+                        cfg.password,
                         statusTopic.c_str(), 1, true,
                         offlineBuffer, true)) {
     unsigned long connectTime = millis() - startTime;
@@ -1248,7 +1263,8 @@ bool quickConnectDefault() {
                     subscribeSuccess ? "成功" : "失敗");
 
       // 發布上線狀態（包含伺服器資訊）
-      publishStatusWithServer(DEFAULT_MQTT_SERVER);
+      publishStatusWithServer(cfg.server);
+      currentServerIndex = index;
 
       return true;
     } else {
@@ -1261,6 +1277,11 @@ bool quickConnectDefault() {
 
   Serial.println("失敗 ✗");
   return false;
+}
+
+// 相容舊呼叫：快速連接第一個預設伺服器
+bool quickConnectDefault() {
+  return quickConnectToIndex(currentServerIndex);
 }
 
 // 快速連接自訂伺服器（使用全域變數中的設定）
@@ -1324,7 +1345,7 @@ bool quickConnectCustom() {
   return false;
 }
 
-// 智慧連接：按優先順序嘗試
+// 智慧連接：按優先順序嘗試所有伺服器
 void smartConnect() {
   Serial.println("=== 開始智慧連接 ===");
 
@@ -1337,35 +1358,25 @@ void smartConnect() {
       failedAttempts = 0;
       return;
     }
-    Serial.println("自訂伺服器失敗，切換到預設伺服器");
+    Serial.println("自訂伺服器失敗，嘗試預設伺服器清單");
   }
 
-  // 2. 嘗試預設伺服器（mqttgo.io）
-  Serial.println("嘗試連接預設伺服器...");
-  if (quickConnectDefault()) {
-    Serial.println("✓ 已連接到預設伺服器");
-    publishServerChangeEvent("default", DEFAULT_MQTT_SERVER);
-    failedAttempts = 0;
-    return;
-  }
-
-  Serial.println("✗ 預設伺服器連接失敗");
-  
-  // 如果預設伺服器失敗，重試幾次
-  for (int attempt = 1; attempt <= 3; attempt++) {
-    Serial.printf("重試第 %d 次...\n", attempt);
-    delay(2000);  // 等待 2 秒後重試
-    
-    if (quickConnectDefault()) {
-      Serial.println("✓ 重試成功，已連接到預設伺服器");
-      publishServerChangeEvent("default", DEFAULT_MQTT_SERVER);
+  // 2. 從上次成功的伺服器開始，輪流嘗試所有預設伺服器
+  for (int i = 0; i < DEFAULT_SERVER_COUNT; i++) {
+    int index = (currentServerIndex + i) % DEFAULT_SERVER_COUNT;
+    if (quickConnectToIndex(index)) {
+      Serial.printf("✓ 已連接到預設伺服器 [%d]: %s\n", index, DEFAULT_SERVERS[index].server);
+      publishServerChangeEvent("default", DEFAULT_SERVERS[index].server);
       failedAttempts = 0;
       return;
     }
+    delay(500);  // 短暫等待後嘗試下一個
   }
 
-  Serial.println("✗ 所有連接嘗試失敗");
-  failedAttempts = 5;  // 設置為最大值，避免持續重試
+  Serial.println("✗ 所有伺服器連接失敗");
+  // 下次重試從下一個伺服器開始
+  currentServerIndex = (currentServerIndex + 1) % DEFAULT_SERVER_COUNT;
+  failedAttempts = 5;
 }
 
 // 保留原有的 connectToMQTT 函數作為向後兼容（現在內部使用 smartConnect）
