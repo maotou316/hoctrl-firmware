@@ -1,0 +1,7 @@
+{
+  "sketch": "ho_relay2.ino",
+  "board": "esp32:esp32:esp32c3",
+  "configuration": "CDCOnBoot=cdc,CPUFreq=160,DebugLevel=error,EraseFlash=all,FlashFreq=80,FlashMode=dio,FlashSize=4M,JTAGAdapter=default,PartitionScheme=custom,UploadSpeed=921600,ZigbeeMode=default",
+  "port": "COM13",
+  "output": "build/vscode"
+}
