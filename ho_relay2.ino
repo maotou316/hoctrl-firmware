@@ -12,7 +12,7 @@
 #include <WiFiClientSecure.h>  // 添加 WiFiClientSecure 庫
 #include <esp_wifi.h>          // ESP32 WiFi 底層 API（PMF 設定等）
 
-const char* firmwareVersion = "1.7.0"; // 當前韌體版本
+const char* firmwareVersion = "1.7.2"; // 當前韌體版本
 // uPesy ESP32 WROOM DevKit
 // LED 閃爍模式定義
 const unsigned long SHORT_BLINK = 200;  // 短閃持續時間 (毫秒)
@@ -33,6 +33,20 @@ BLEServer *pServer = NULL;
 BLECharacteristic *pCharacteristic = NULL;
 bool deviceConnected = false;
 
+// 設定已存、等待重啟的時間點；0 代表沒有待處理的重啟。
+//
+// 為什麼不能在 onWrite() 裡直接 ESP.restart()：esp32 core 3.x 的
+// BLECharacteristic::handleGATTServerEvent()（ESP_GATTS_WRITE_EVT）是
+// 「先呼叫 onWrite()，回來之後才 esp_ble_gatts_send_response()」。
+// 在回調裡重開機，那個 ATT 寫入回應永遠送不出去，App 端的
+// write(withoutResponse: false) 只會等到連線被重開機切斷 —— 設定明明已經
+// 存進 NVS，App 卻顯示「與設備的藍牙連線已中斷」並放棄新增設備。
+// 舊版 core 是先送回應再呼叫 onWrite，所以這個寫法以前不會出事。
+//
+// 擋不住什麼：這只保證「回應有機會送出」。App 若在這 2 秒內自己離開頁面、
+// 或封包在空中掉了，一樣會走到斷線那條路，那一層靠 App 端的補救判定。
+volatile unsigned long bleRestartAt = 0;
+
 
 const char* deviceModel = "hoRelay2"; // 設備型號
 
@@ -40,8 +54,8 @@ const char* deviceModel = "hoRelay2"; // 設備型號
 const int bootButton = 9;     // BOOT 按鈕在 GPIO 9
 const int resetButton = 1;        // 
 
-const int ledOnBoard = 3;    // 第二個按鈕在 GPIO 8
-const int ledOnFace = 0;        // 
+const int ledOnBoard = 3;    // 板載 LED 在 GPIO 3（舊註釋誤寫成「第二個按鈕在 GPIO 8」）
+const int ledOnFace = 0;     // 面板 LED 在 GPIO 0
 // 繼電器腳位：兩版板子分別接在不同腳位
 //   341305A_P25_250814 → GPIO 7
 //   341305A_Y176_250318 → GPIO 4
@@ -76,8 +90,10 @@ String deviceIdString;                // 儲存格式化後的設備 ID
 String legacyDeviceIdString;          // 舊版（MAC 反序）設備 ID，僅用於相容尚未更新的 App
 bool relayState = false;              // 繼電器狀態
 bool bleConfigMode = false;           // BLE 配對模式標誌
-unsigned long wifiDisconnectStart = 0; // WiFi 斷線起始時間（用於 30 秒後熄燈）
-const unsigned long LED_TIMEOUT = 30000; // 30 秒後停止閃爍
+unsigned long wifiDisconnectStart = 0;      // WiFi 斷線起始時間（用於切換到心跳閃）
+const unsigned long LED_TIMEOUT = 30000;    // 斷線超過這麼久，由快閃改為低頻心跳閃
+const unsigned long HEARTBEAT_PERIOD = 3000; // 心跳閃週期
+const unsigned long HEARTBEAT_ON = 100;      // 心跳閃每次亮燈時間（duty cycle ≈ 3%）
 
 // ── MQTT 連線速度 ──
 // 只用來印警告，不用來否決連線。詳見 quickConnectToIndex() 裡的說明。
@@ -380,12 +396,21 @@ void blinkLED() {
       lastBlinkTime = currentTime;
     }
   } else if (WiFi.status() != WL_CONNECTED) {
-    // WiFi 未連接模式：記錄斷線時間，30 秒內快速閃爍，之後熄燈
+    // WiFi 未連接模式：前 LED_TIMEOUT 快閃提示，之後轉為低頻心跳閃
+    //
+    // 【為什麼不再永久熄燈】
+    // 舊版超過 LED_TIMEOUT 就 digitalWrite(LOW) 熄到底，而 wifiDisconnectStart
+    // 只有「WiFi 連上」才會歸零（本函式僅在另外兩個分支重置它）。開機後的
+    // connectToWiFi() 每種 auth 模式要等 10 秒、還要輪好幾種，等它跑完進 loop，
+    // 30 秒早就用光了 —— 結果是「從來就連不上的設備一次也不閃」，正好把最需要
+    // 指示燈的情境變成沒有指示燈（現場實測：reason 15 連續重試，面板燈全暗）。
+    // 現在改成心跳閃：每 HEARTBEAT_PERIOD 亮 HEARTBEAT_ON，duty cycle 約 3%，
+    // 比原本 50% 的快閃更省電，同時永遠看得出「我還沒連上」。
     if (wifiDisconnectStart == 0) {
       wifiDisconnectStart = currentTime;
     }
     if (currentTime - wifiDisconnectStart < LED_TIMEOUT) {
-      // 30 秒內：快速閃爍
+      // 剛斷線：快速閃爍
       if (currentTime - lastBlinkTime >= QUICK_BLINK) {
         ledState = !ledState;
         digitalWrite(ledOnFace, ledState);
@@ -393,9 +418,11 @@ void blinkLED() {
         lastBlinkTime = currentTime;
       }
     } else {
-      // 超過 30 秒：熄燈省電
-      digitalWrite(ledOnFace, LOW);
-      digitalWrite(ledOnBoard, LOW);
+      // 長時間斷線：低頻心跳閃省電。直接由 millis() 決定亮滅，不動 ledState，
+      // 之後若重連成功再斷線，快閃分支會從它自己的 lastBlinkTime 重新起算。
+      bool heartbeatOn = (currentTime % HEARTBEAT_PERIOD) < HEARTBEAT_ON;
+      digitalWrite(ledOnFace, heartbeatOn ? HIGH : LOW);
+      digitalWrite(ledOnBoard, heartbeatOn ? HIGH : LOW);
     }
   } else if (WiFi.status() == WL_CONNECTED && !mqttClient.connected()) {
     wifiDisconnectStart = 0;  // WiFi 已連上，重置斷線計時
@@ -522,8 +549,11 @@ class MyCallbacks: public BLECharacteristicCallbacks {
                         pCharacteristic->notify();
 
                         free(buffer);
-                        delay(2000);
-                        ESP.restart();
+                        // 排程重啟而非就地重啟：先讓 onWrite() 返回，
+                        // BLE stack 才送得出 ATT 寫入回應（見 bleRestartAt 宣告）
+                        bleRestartAt = millis() + 2000;
+                        if (bleRestartAt == 0) bleRestartAt = 1;
+                        return;
                     } else {
                         // 錯誤回應
                         StaticJsonDocument<200> response;
@@ -826,10 +856,19 @@ void setup()
 
   printRelayPins();
 
-  // 設定並關閉內建 LED
-  pinMode(ledOnBoard, INPUT);  // 初始化第二個按鈕
+  // 設定並關閉兩顆 LED
+  //
+  // 【這裡曾經是 INPUT，不要再改回去】
+  // 舊版寫 pinMode(ledOnBoard, INPUT)，註釋還誤標成「初始化第二個按鈕」。
+  // GPIO 3 是板載 LED（見 readme 的 GPIO 定義），設成輸入模式後全檔案 14 處
+  // digitalWrite(ledOnBoard, ...) 全都推不動它 —— 板載燈從頭到尾一次也沒亮過，
+  // 所有靠板載燈判讀的狀態指示（WiFi 未連接快閃、MQTT 未連接一長二短、
+  // 長按重置確認閃爍）在硬體上都是無效的。
+  // GPIO 3 在 ESP32-C3 不是 strapping pin，也沒有被按鈕（GPIO 9 / GPIO 1）
+  // 或繼電器（GPIO 4 / GPIO 7）佔用，設成 OUTPUT 沒有副作用。
+  pinMode(ledOnBoard, OUTPUT);
   digitalWrite(ledOnBoard, LOW);  // 關閉 LED
-  
+
   pinMode(ledOnFace, OUTPUT);
   digitalWrite(ledOnFace, LOW);  // 關閉 LED
 
@@ -886,6 +925,13 @@ void setup()
 
 void loop()
 {
+
+  // ── BLE 配網完成後的排程重啟 ──
+  // onWrite() 不能就地重啟，否則 ATT 寫入回應送不出去（見 bleRestartAt 宣告）。
+  if (bleRestartAt != 0 && (long)(millis() - bleRestartAt) >= 0) {
+    Serial.println("[BLE] 重新啟動");
+    ESP.restart();
+  }
   // 讀取按鈕當前狀態（開機診斷判定卡在 LOW 的腳一律視為 HIGH，不參與重置流程）
   bool currentBootState = bootButtonUsable ? digitalRead(bootButton) : HIGH;
   bool currentResetState = resetButtonUsable ? digitalRead(resetButton) : HIGH;

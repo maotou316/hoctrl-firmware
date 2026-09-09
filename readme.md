@@ -1,11 +1,11 @@
 ### hoRelay2
 - **開發板**: ESP32-C3 Dev Module
 - **特色**: 無聲繼電器
-- **韌體版本**: 1.6.1
+- **韌體版本**: 1.7.2
 - **GPIO 定義**:
   - BOOT 按鈕: GPIO 9
   - RESET 按鈕: GPIO 1
-  - 板載 LED: GPIO 3
+  - 板載 LED: GPIO 3（`setup()` 必須設成 `OUTPUT`；1.7.2 之前誤設為 `INPUT`，板載燈從未亮過）
   - 面板 LED: GPIO 0
   - 繼電器按鈕: GPIO 4 與 GPIO 7（兩支同時驅動，單一韌體通吃兩版板子）
     - 341305A_P25_250814 → 實際接在 GPIO 7
@@ -85,7 +85,7 @@ Set-Location A:\project\hoctrl_arduino
 | 狀態 | LED 行為 |
 |------|----------|
 | BLE 配對模式（含長按清除設定後）| 快閃 200ms（`PAIRING_BLINK`），持續不熄燈 |
-| WiFi 未連接 | 快閃 300ms（`QUICK_BLINK`），30 秒後熄燈省電 |
+| WiFi 未連接 | 快閃 300ms（`QUICK_BLINK`），滿 30 秒（`LED_TIMEOUT`）後轉為心跳閃：每 3 秒亮 100ms（`HEARTBEAT_PERIOD` / `HEARTBEAT_ON`），連不上就一直閃不熄燈 |
 | WiFi 已連、MQTT 未連 | 一長二短 |
 | WiFi 與 MQTT 都已連上 | 熄燈 |
 | 長按重置確認中 | 閃爍 250ms（`BLINK_INTERVAL`），確認後長亮 0.7 秒 |
@@ -148,6 +148,25 @@ RESET 按鈕 GPIO 1 內部短路）。副作用：「按住按鈕再上電」會
 ---
 
 ## 版本記錄
+
+### 1.7.2
+
+**修正「WiFi 連不上時完全沒有燈號」。** 兩個獨立缺陷疊在一起，
+造成最需要指示燈的情境（設備始終連不上）反而一顆燈都不亮：
+
+- **板載 LED 從未被驅動。** `setup()` 裡是 `pinMode(ledOnBoard, INPUT)`，
+  註釋還誤標成「初始化第二個按鈕」。GPIO 3 設成輸入模式後，全檔案 14 處
+  `digitalWrite(ledOnBoard, ...)` 全部推不動它。**已改為 `OUTPUT`**
+- **斷線 30 秒後永久熄燈。** `blinkLED()` 的 `wifiDisconnectStart` 只有
+  「WiFi 連上」才會歸零，而開機的 `connectToWiFi()` 每種 auth 模式就要等 10 秒、
+  還要輪好幾種，等它跑完進 `loop()`，`LED_TIMEOUT` 早就用光 → 連不上的設備
+  從頭到尾是暗的。**已改為滿 30 秒後轉低頻心跳閃**（每 3 秒亮 100ms，
+  duty cycle 約 3%，比原本 50% 的快閃更省電，且永遠看得出「我還沒連上」）
+
+沒有改成「每次重試重置計時」，因為補送 `esp_wifi_connect()` 的間隔是 10 秒
+（`WIFI_KICK_INTERVAL_MS`）< `LED_TIMEOUT`，那樣等於退回全速快閃、省電完全失效。
+
+**實測狀態**：僅通過編譯，**尚未實機驗證**。
 
 ### 1.7.0
 
