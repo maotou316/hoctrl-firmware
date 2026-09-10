@@ -12,7 +12,7 @@
 #include <WiFiClientSecure.h>  // 添加 WiFiClientSecure 庫
 #include <esp_wifi.h>          // ESP32 WiFi 底層 API（PMF 設定等）
 
-const char* firmwareVersion = "1.7.2"; // 當前韌體版本
+const char* firmwareVersion = "1.8.3"; // 當前韌體版本
 // uPesy ESP32 WROOM DevKit
 // LED 閃爍模式定義
 const unsigned long SHORT_BLINK = 200;  // 短閃持續時間 (毫秒)
@@ -63,6 +63,49 @@ const int ledOnFace = 0;     // 面板 LED 在 GPIO 0
 // 這樣可避免腳位設錯時該腳未初始化而浮空，導致 MOS 誤導通、繼電器恆閉燒毀設備。
 const int relayPins[] = {4, 7};
 const int relayPinCount = sizeof(relayPins) / sizeof(relayPins[0]);
+
+// ── 電量檢測：GPIO 1 一支腳同時當「電池分壓量測」與「RESET 按鈕」──
+//
+// 為什麼擠在同一支腳：ESP32-C3 能接 ADC1 的只有 GPIO 0~4（ADC2 的 GPIO 5 在
+// WiFi 開啟時讀不到值，這台設備全程掛著 WiFi/MQTT，等於不能用），而板子上
+// 實際拉出可焊接的只有 GPIO 0（面板 LED）與 GPIO 1（RESET 按鈕）。
+//
+// 能共用的原理：按鈕的動作本來就是「把腳拉到 GND」，在 ADC 眼裡就是電壓掉到 0。
+// 所以全程只讀 ADC，不切 pinMode，就同時得到兩件事：
+//   1.20~1.68V → 電池 6.0~8.4V（2S 鋰電，模組原廠 5 倍分壓，不需改電阻）
+//   < 0.5V     → RESET 按鈕被按下
+// 按下時是 0V，離電池空電的 1.20V 有 2.4 倍距離，不可能誤判。
+//
+// 接線：分壓模組 S 腳接 GPIO 1，按鈕維持原本的 GPIO 1 ↔ GND。
+// 模組的 "+" 腳不用接（純電阻分壓，那支腳沒作用）。S 腳對 GND 要加 100nF，
+// 否則模組 6kΩ 的輸出阻抗擋不住 ESP32 ADC 取樣電容造成的抖動。
+const int batterySensePin = 1;                    // 與 resetButton 同一支腳
+
+// 選配的 100kΩ 上拉（GPIO 1 → 3.3V）會讓讀值線性偏移，換算係數因此有兩組。
+// 加上拉的用意是防「分壓模組焊點脫落」：沒有它，模組一掉線 GPIO 1 就浮空，
+// ADC 讀隨機值有機率掉進按鈕門檻而誤觸重置、把 WiFi 設定清光。
+// 加了之後脫落 = 讀到接近 3.3V，會被 BATTERY_OPEN_MV 判為量測異常。
+#define BATTERY_HAS_PULLUP 0                      // 焊了 100kΩ 上拉就改成 1
+#if BATTERY_HAS_PULLUP
+const float BATTERY_SCALE = 5.3f;                 // Vbat = (Vadc - offset) * scale
+const int BATTERY_OFFSET_MV = 187;                // 100k 上拉造成的固定抬升
+#else
+const float BATTERY_SCALE = 5.0f;                 // 模組原廠分壓比
+const int BATTERY_OFFSET_MV = 0;
+#endif
+
+const int BATTERY_BUTTON_MV = 500;    // ADC 低於此值 → 判定 RESET 按鈕按下
+const int BATTERY_OPEN_MV = 2500;     // ADC 高於此值 → 判定分壓模組脫落／量測異常
+const int BATTERY_SAMPLES = 8;        // 電量量測的取樣次數（按鈕偵測只取 1 次，不能拖慢 loop）
+const unsigned long BATTERY_READ_INTERVAL_MS = 5000;  // 電量重新量測的間隔
+
+// 分壓模組是否真的焊上去了（開機時自動偵測，見 detectBatterySense()）。
+// 沒焊的板子退回原本的 INPUT_PULLUP 按鈕模式，單一韌體通吃改裝前後兩種板子，
+// 與繼電器「GPIO 4/7 兩支同時驅動」是同一套哲學。
+bool batterySenseAvailable = false;
+int lastBatteryMilliVolts = 0;        // 最近一次有效的電池電壓（mV），0 代表還沒量到
+int lastBatteryPercent = -1;          // 最近一次有效的電量百分比，-1 代表未知
+unsigned long lastBatteryReadTime = 0;
 
 // 其他全域變數
 unsigned long buttonPressTime = 0;    // 記錄按下的時間
@@ -198,39 +241,67 @@ bool anyResetButtonPressed();
 void publishStatus();
 void smartConnectStep();
 void resetMqttProbe();
+void detectBatterySense();
+bool isResetButtonPressed();
+void updateBatteryReading();
+void addBatteryToStatus(JsonDocument& doc);
+
+// ── EEPROM 佈局 ──
+//
+// 【1.7.3 之前這裡是壞的，不要改回去】
+// 舊版 EEPROM.begin(128) 但 mqttPassword 寫在 114~129：
+//   * 126 / 127 兩格同時被 mqttPort 寫入，且 mqttPort 寫在後面 → 覆蓋掉密碼第 13、14 字元
+//   * 128 / 129 超出 begin(128) 宣告的範圍 → 第 15、16 字元直接寫丟
+// 也就是說 MQTT 密碼實際上只有前 12 字元是可靠的，第 13 字元起是 port 的位元組殘留。
+// 現在把區塊搬到 130 起、EEPROM 放大到 160。
+//
+// 【為什麼只搬 mqttPassword，其他一格都不動】
+// 搬動任何欄位都會讓已出貨設備在 OTA 之後讀到空值。ssid / password / mqttServer /
+// useCustomServer / mqttUsername / mqttPort 全部維持原位，升級後照常運作；
+// 只有 mqttPassword 需要重設 —— 而它本來就是壞的（超過 12 字元必定讀錯），
+// 搬移是把一份不可靠的資料換成可靠的，不是把好資料弄丟。
+const int EEPROM_SIZE      = 160;
+const int EE_SSID          = 0;    // 0~31    SSID (32)
+const int EE_PASSWORD      = 32;   // 32~63   WiFi 密碼 (32)
+const int EE_MQTT_SERVER   = 64;   // 64~95   MQTT 伺服器 (32)
+const int EE_USE_CUSTOM    = 96;   // 96      是否使用自訂伺服器 (1)
+                                   // 97      保留（未使用）
+const int EE_MQTT_USER     = 98;   // 98~113  MQTT 帳號 (16)
+const int EE_MQTT_PORT     = 126;  // 126~127 MQTT Port (2)
+const int EE_MQTT_PASSWORD = 130;  // 130~145 MQTT 密碼 (16)
 
 // WiFi 設定相關函數實作
 void saveWiFiConfig() {
-  EEPROM.begin(128);
+  EEPROM.begin(EEPROM_SIZE);
   // 儲存 WiFi 設定
   for (int i = 0; i < 32; i++) {
-    EEPROM.write(i, ssid[i]);
-    EEPROM.write(i + 32, password[i]);
+    EEPROM.write(EE_SSID + i, ssid[i]);
+    EEPROM.write(EE_PASSWORD + i, password[i]);
   }
   // 儲存自訂 MQTT 伺服器設定
   for (int i = 0; i < 32; i++) {
-    EEPROM.write(i + 64, mqttServer[i]);
+    EEPROM.write(EE_MQTT_SERVER + i, mqttServer[i]);
   }
   // 儲存 MQTT 認證資訊
   for (int i = 0; i < 16; i++) {
-    EEPROM.write(i + 98, mqttUsername[i]);   // 98-113: MQTT 帳號
-    EEPROM.write(i + 114, mqttPassword[i]);  // 114-129: MQTT 密碼
+    EEPROM.write(EE_MQTT_USER + i, mqttUsername[i]);
+    EEPROM.write(EE_MQTT_PASSWORD + i, mqttPassword[i]);
   }
   // 儲存 MQTT Port (2 bytes)
-  EEPROM.write(126, mqttPort & 0xFF);        // 低位元組
-  EEPROM.write(127, (mqttPort >> 8) & 0xFF); // 高位元組
-  
+  EEPROM.write(EE_MQTT_PORT, mqttPort & 0xFF);            // 低位元組
+  EEPROM.write(EE_MQTT_PORT + 1, (mqttPort >> 8) & 0xFF); // 高位元組
+
   // 儲存 useCustomServer 標誌
-  EEPROM.write(96, useCustomServer ? 1 : 0);
+  EEPROM.write(EE_USE_CUSTOM, useCustomServer ? 1 : 0);
 
   EEPROM.commit();
 }
 
 void loadWiFiConfig() {
-  EEPROM.begin(128);
+  EEPROM.begin(EEPROM_SIZE);
 
   // 檢查 EEPROM 是否已初始化（檢查第一個字元是否為可列印字元或 NULL）
-  char firstChar = EEPROM.read(0);
+  char firstChar = EEPROM.read(EE_SSID);
   bool isEEPROMValid = (firstChar >= 32 && firstChar <= 126) || firstChar == 0;
 
   if (!isEEPROMValid) {
@@ -244,20 +315,20 @@ void loadWiFiConfig() {
 
   // 讀取 WiFi 設定
   for (int i = 0; i < 32; i++) {
-    ssid[i] = EEPROM.read(i);
-    password[i] = EEPROM.read(i + 32);
+    ssid[i] = EEPROM.read(EE_SSID + i);
+    password[i] = EEPROM.read(EE_PASSWORD + i);
   }
   // 讀取自訂 MQTT 伺服器設定
   for (int i = 0; i < 32; i++) {
-    mqttServer[i] = EEPROM.read(i + 64);
+    mqttServer[i] = EEPROM.read(EE_MQTT_SERVER + i);
   }
   // 讀取 MQTT 認證資訊
   for (int i = 0; i < 16; i++) {
-    mqttUsername[i] = EEPROM.read(i + 98);   // 98-113: MQTT 帳號
-    mqttPassword[i] = EEPROM.read(i + 114);  // 114-129: MQTT 密碼
+    mqttUsername[i] = EEPROM.read(EE_MQTT_USER + i);
+    mqttPassword[i] = EEPROM.read(EE_MQTT_PASSWORD + i);
   }
   // 讀取 MQTT Port (2 bytes)
-  mqttPort = EEPROM.read(126) | (EEPROM.read(127) << 8);
+  mqttPort = EEPROM.read(EE_MQTT_PORT) | (EEPROM.read(EE_MQTT_PORT + 1) << 8);
   if (mqttPort == 0 || mqttPort == 0xFFFF) {
     mqttPort = 1883;  // 預設值
   }
@@ -292,14 +363,184 @@ void clearWiFiConfig() {
     delay(1000); // 確保訊息有時間發送
   }
 
-  EEPROM.begin(128);  // 增加 EEPROM 大小
-  for (int i = 0; i < 128; i++) {  // 清除所有設定包括 MQTT
+  EEPROM.begin(EEPROM_SIZE);
+  for (int i = 0; i < EEPROM_SIZE; i++) {  // 清除所有設定包括 MQTT
     EEPROM.write(i, 0);
   }
   EEPROM.commit();
+
+  // ── 一併清除 WiFi driver 自己存在 NVS 的舊 AP ──
+  //
+  // 【為什麼一定要做這件事】
+  // 清 EEPROM 只清掉「韌體自己記的那份」。WiFi driver 在 NVS 裡還留著上一次連上的
+  // AP（SSID／密碼／PMK 快取），而 setup() 的 WiFi.setAutoReconnect(true) 會讓它
+  // 開機就拿那份去連。結果是：
+  //   1. 使用者長按重置、用 App 綁定新的 SSID、設備重開
+  //   2. driver 在背景連「舊 AP」，connectToWiFi() 在前景連「新 AP」，兩邊互搶
+  //   3. 4-way handshake 每次做到一半被對方的 connect() 打斷 → 五種模式全部 reason 15
+  //      （序列埠同時會出現 `E wifi:sta is connecting, cannot set config`，
+  //        以及每個模式開頭的 reason 8 ASSOC_LEAVE，那是被自己人斷開的痕跡）
+  //   4. 第一次探測把 NVS 覆寫成新 AP，所以「再清除一次、再綁定一次」就會成功
+  // 這正是 2026-09 回報的「第一次綁定必定失敗、第二次才成功」。
+  //
+  // esp_wifi_restore() 把 driver 的持久化設定整份還原成預設值。反正下一行就要重啟，
+  // 還原後 WiFi stack 的狀態不需要考慮。
+  WiFi.disconnect(false, true);  // 第二個參數才是 eraseap，先清掉當前的 AP 記錄
+  delay(100);
+  esp_err_t wifiRestoreErr = esp_wifi_restore();
+  if (wifiRestoreErr == ESP_OK) {
+    Serial.println("WiFi driver 的 NVS 設定已還原（舊 AP 不會再被自動重連）");
+  } else {
+    Serial.printf("⚠ esp_wifi_restore() 失敗: %s，舊 AP 可能仍留在 NVS\n",
+                  esp_err_to_name(wifiRestoreErr));
+  }
+
   Serial.println("WiFi 設定已清除。重新啟動中...");
   delay(2000);
   ESP.restart();
+}
+
+// ── 電量檢測相關函式 ──
+
+// 開機時偵測分壓模組是否存在，決定 GPIO 1 走 ADC 模式還是原本的 INPUT_PULLUP 按鈕模式。
+//
+// 原理：開內部下拉，用 ADC 讀電壓。
+//   有模組 → 分壓源阻抗僅 6kΩ，對抗內部 45kΩ 下拉後仍有約 1.0~1.5V
+//   沒模組 → 腳被內部下拉直接扯到 GND → 接近 0mV
+// 【1.8.3 起改用 ADC 判斷，不能用 digitalRead】1.8.0 的寫法是 INPUT_PULLDOWN 後
+// digitalRead 看 HIGH/LOW，但有模組時腳上那 1.48V 對 ESP32-C3 的數位輸入是灰色地帶
+// （判 HIGH 要 ≥2.5V、判 LOW 要 ≤0.8V），實機讀成 LOW → 判成沒模組 → 退回
+// INPUT_PULLUP 按鈕模式 → 分壓輸出約 1.7V 又落在灰色地帶被讀成 LOW → 一開機就
+// 「偵測到按鈕按下，開始計時」（2026-09-10 第一次接模組實測）。ADC 讀 mV 兩邊差十倍以上，
+// 沒有灰色地帶。
+//
+// analogRead 附掛腳位時會把腳改成 ANALOG 模式、拿掉上下拉，所以下拉要在附掛之後
+// 用 gpio_pulldown_en() 補回來；偵測完成後再拿掉，否則 45kΩ 下拉會並聯到分壓下臂，
+// 讀值會偏低約 14%。
+//
+// 沒有這道偵測的話，未改裝的板子刷上這版韌體會很慘：GPIO 1 沒了 INPUT_PULLUP
+// 又只接一顆對地按鈕，等於浮空，ADC 讀隨機值隨時可能掉進按鈕門檻而誤觸重置。
+//
+// 誤判情境：開機瞬間按住 RESET 按鈕會把腳短路到地，被判成「沒有模組」。
+// 可接受 —— 按住按鈕開機本來就不是合法流程（見 checkStuckButtons() 的註釋），
+// 放開後重新上電即恢復。
+const int BATTERY_DETECT_MV = 600;    // 開下拉後 ADC 高於此值 → 判定有分壓模組
+
+void detectBatterySense() {
+  analogReadResolution(12);
+  analogReadMilliVolts(batterySensePin);               // 先附掛成 ANALOG，之後才能設衰減、補下拉
+  analogSetPinAttenuation(batterySensePin, ADC_11db);  // 量程約 0~2.5V 線性，涵蓋 1.20~1.68V
+                                                       // （放在附掛前會印 "Pin is not configured as analog channel"）
+  gpio_pulldown_en((gpio_num_t)batterySensePin);
+  delay(20);  // 等內部下拉把腳位拉穩
+  int detectMv = readSenseMilliVolts(8);
+  gpio_pulldown_dis((gpio_num_t)batterySensePin);
+
+  // 診斷指紋：再開上拉量一次，分辨「沒接模組」（≈3300）與「模組接了但沒供電」
+  // （S 經 7.5kΩ 到地，≈470，會被按鈕模式當成按下）。只印出來，不參與判定。
+  gpio_pullup_en((gpio_num_t)batterySensePin);
+  delay(20);
+  int pullupMv = readSenseMilliVolts(8);
+  gpio_pullup_dis((gpio_num_t)batterySensePin);
+  Serial.printf("電量檢測: 指紋 開下拉 %d mV / 開上拉 %d mV（沒模組≈0/3300、模組沒電≈0/470、模組有電≈1300/1700）\n",
+                detectMv, pullupMv);
+
+  batterySenseAvailable = (detectMv >= BATTERY_DETECT_MV);
+
+  if (batterySenseAvailable) {
+    delay(20);  // 下拉拿掉後讓分壓回到真實電位
+    int senseMv = readSenseMilliVolts(BATTERY_SAMPLES);
+    Serial.printf("電量檢測: 已啟用（GPIO %d 走 ADC，兼作 RESET 按鈕；偵測 %d mV，分壓 %d mV → 電池約 %d mV）\n",
+                  batterySensePin, detectMv, senseMv, senseToBatteryMilliVolts(senseMv));
+  } else {
+    pinMode(batterySensePin, INPUT_PULLUP);
+    Serial.printf("電量檢測: 未偵測到分壓模組（開下拉後偵測 %d mV，門檻 %d mV），GPIO %d 退回按鈕模式\n",
+                  detectMv, BATTERY_DETECT_MV, batterySensePin);
+    // 「模組接了但沒供電」保護：S 經模組下臂 7.5kΩ 通到地，開上拉只剩約 500mV，
+    // 按鈕模式會把它當成一直按著，3 秒後觸發長按重置、清光 WiFi 設定
+    // （2026-09-10 第一次接模組、VCC 沒接上，實測指紋 0/527）。
+    // 沒接模組時開上拉是 ≈3300，正常按鈕放開也是 ≈3300，所以低於 2000 一定是線上
+    // 掛了外部東西。這種狀態下停用重置按鈕，寧可少一個功能也不能自毀設定。
+    if (pullupMv < 2000) {
+      resetButtonUsable = false;
+      Serial.printf("⚠ 電量檢測: 開上拉僅 %d mV，GPIO %d 被外部拉低（分壓模組接了但沒供電？），"
+                    "本次開機停用 RESET 按鈕以免誤觸重置。請檢查模組 VCC/GND 是否接到電池\n",
+                    pullupMv, batterySensePin);
+    }
+  }
+}
+
+// 讀 GPIO 1 的電壓（mV）。用 analogReadMilliVolts() 而非 analogRead()：
+// 前者會套用 eFuse 裡的出廠校準，ESP32 的 ADC 非線性很嚴重，自己乘係數會差到 5% 以上。
+int readSenseMilliVolts(int samples) {
+  long total = 0;
+  for (int i = 0; i < samples; i++) {
+    total += analogReadMilliVolts(batterySensePin);
+  }
+  return (int)(total / samples);
+}
+
+// 把分壓後的讀值換算回電池電壓（mV）
+int senseToBatteryMilliVolts(int senseMv) {
+  int corrected = senseMv - BATTERY_OFFSET_MV;
+  if (corrected < 0) corrected = 0;
+  return (int)(corrected * BATTERY_SCALE);
+}
+
+// 2S 鋰電的放電曲線查表（單顆 SOC 曲線 ×2）。
+// 不用線性換算是因為鋰電中段極為平坦：7.74V 到 7.58V 之間就跨掉 20% 電量，
+// 而線性法會把這段算成 6%，App 上會看到「電量卡在 60% 很久然後瞬間掉光」。
+int batteryPercentFromMilliVolts(int mv) {
+  static const int curve[][2] = {
+    {8400, 100}, {8120, 90}, {7960, 80}, {7840, 70}, {7740, 60}, {7640, 50},
+    {7580, 40}, {7540, 30}, {7480, 20}, {7360, 10}, {6900, 5}, {6000, 0}
+  };
+  const int points = sizeof(curve) / sizeof(curve[0]);
+
+  if (mv >= curve[0][0]) return 100;
+  if (mv <= curve[points - 1][0]) return 0;
+
+  for (int i = 0; i < points - 1; i++) {
+    if (mv <= curve[i][0] && mv > curve[i + 1][0]) {
+      int mvSpan = curve[i][0] - curve[i + 1][0];
+      int pctSpan = curve[i][1] - curve[i + 1][1];
+      return curve[i + 1][1] + (mv - curve[i + 1][0]) * pctSpan / mvSpan;
+    }
+  }
+  return 0;
+}
+
+// RESET 按鈕是否被按下。
+// ADC 模式只取樣一次：這個函式在 loop 每一圈都會跑，8 次取樣會拖慢整個迴圈。
+bool isResetButtonPressed() {
+  if (!batterySenseAvailable) {
+    return digitalRead(batterySensePin) == LOW;
+  }
+  return analogReadMilliVolts(batterySensePin) < BATTERY_BUTTON_MV;
+}
+
+// 定期更新電池讀值。按鈕按住時腳被拉到地、模組脫落時讀值飄高，
+// 這兩種情況都不覆寫 lastBatteryMilliVolts —— 否則 App 會在使用者長按重置的那幾秒
+// 看到電量瞬間掉到 0，跳出「沒電」警告。
+void updateBatteryReading() {
+  if (!batterySenseAvailable) return;
+  if (millis() - lastBatteryReadTime < BATTERY_READ_INTERVAL_MS) return;
+  lastBatteryReadTime = millis();
+
+  int senseMv = readSenseMilliVolts(BATTERY_SAMPLES);
+  if (senseMv < BATTERY_BUTTON_MV || senseMv > BATTERY_OPEN_MV) return;  // 按鈕按住／量測異常，沿用舊值
+
+  lastBatteryMilliVolts = senseToBatteryMilliVolts(senseMv);
+  lastBatteryPercent = batteryPercentFromMilliVolts(lastBatteryMilliVolts);
+}
+
+// 把電量資訊掛進 status JSON。publishStatus() 與 publishStatusWithServer() 共用。
+void addBatteryToStatus(JsonDocument& doc) {
+  if (!batterySenseAvailable) return;
+  JsonObject battery = doc.createNestedObject("battery");
+  battery["mv"] = lastBatteryMilliVolts;
+  battery["percent"] = lastBatteryPercent;
+  battery["valid"] = (lastBatteryPercent >= 0);
 }
 
 // 開機按鈕自檢：短暫取樣兩支按鈕腳，整段都是 LOW 即判定卡住並停用其重置功能
@@ -313,7 +554,9 @@ void checkStuckButtons() {
 
   for (int i = 0; i < totalSamples; i++) {
     if (digitalRead(bootButton) == LOW) bootLowCount++;
-    if (digitalRead(resetButton) == LOW) resetLowCount++;
+    // ADC 模式下「恆低」多了一種可能：電池電壓低到分壓後不足 0.5V（即電池 2.5V）。
+    // 2S 鋰電到那個電壓保護板早就斷電、板子也不會通電，實務上仍等同按鈕短路。
+    if (isResetButtonPressed()) resetLowCount++;
     delay(BTN_SELFTEST_INTERVAL);
   }
 
@@ -337,7 +580,7 @@ void checkStuckButtons() {
 // 是否有「可用的」按鈕正被按下；診斷判定卡住的腳一律視為未按下
 bool anyResetButtonPressed() {
   if (bootButtonUsable && digitalRead(bootButton) == LOW) return true;
-  if (resetButtonUsable && digitalRead(resetButton) == LOW) return true;
+  if (resetButtonUsable && isResetButtonPressed()) return true;
   return false;
 }
 
@@ -632,16 +875,36 @@ const char* getLegacyDeviceId() {
 // reset 後的狀態不保證為低電位，越晚拉低、MOS 誤導通的時間窗就越長
 void initRelayPins() {
   for (int i = 0; i < relayPinCount; i++) {
+    // 上一輪 hold 可能還鎖著（軟體重啟、OTA 重啟後 hold 不會自己清），先解鎖才能設定
+    gpio_hold_dis((gpio_num_t)relayPins[i]);
     pinMode(relayPins[i], OUTPUT);
     digitalWrite(relayPins[i], LOW);
+    holdRelayPin(relayPins[i]);
   }
   relayState = false;
+}
+
+// 【用 pad hold 代替板子上缺的 gate 下拉電阻】兩版板子的 MOS gate 都沒有下拉，
+// 晶片沒在驅動腳位時（reset 空窗、卡在 ROM 下載模式、IDE 監視開關把 C3 重置）
+// gate 浮空或被內部上拉推高，P25 版繼電器會穩定常開（2026-09-09／10 兩塊板實測）。
+// 板子是定制的無法補焊，改用 gpio_hold_en()：把 pad 鎖在目前輸出電位，之後
+// 軟體重啟、EN 重置、下載模式都維持鎖住的電位，只有斷電重上電會清掉。
+// 代價是 hold 期間 digitalWrite 無效，所以 setRelayPins() 要先解鎖、切換、再鎖回去。
+void holdRelayPin(int pin) {
+  // 【鎖之前一定要等 pad 真的變成新電位】hold 鎖住的是「鎖定當下 pad 的實際電位」，
+  // 不是 GPIO 暫存器的值。digitalWrite 寫進暫存器到 pad 翻轉有數十 ns 延遲，
+  // 緊接著就 gpio_hold_en 會鎖到舊電位——1.8.2 第一版就是這樣：韌體回報 relay=1、
+  // 序列印「繼電器 ON」，pad 卻一直是 LOW，負載完全不動（2026-09-10 實測）。
+  delayMicroseconds(20);
+  gpio_hold_en((gpio_num_t)pin);
 }
 
 // 同時設定所有繼電器腳位的輸出
 void setRelayPins(bool on) {
   for (int i = 0; i < relayPinCount; i++) {
+    gpio_hold_dis((gpio_num_t)relayPins[i]);
     digitalWrite(relayPins[i], on ? HIGH : LOW);
+    holdRelayPin(relayPins[i]);
   }
   relayState = on;
 }
@@ -780,12 +1043,17 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
                     currentServerIndex, DEFAULT_SERVERS[currentServerIndex].server);
     } else if (message.startsWith("update:")) {
       // 解析更新命令
-      StaticJsonDocument<200> doc;
+      // 容量要放得下 version + url（GitHub Release 網址近百字元）+ md5(32)，
+      // 200 bytes 裝不下三個欄位，溢位時 deserializeJson 會回 NoMemory 而整個指令被忽略。
+      StaticJsonDocument<384> doc;
       DeserializationError error = deserializeJson(doc, message.substring(7));
 
-      if (!error) {
+      if (error) {
+        Serial.printf("更新指令解析失敗：%s\n", error.c_str());
+      } else {
         const char* newVersion = doc["version"];
         const char* downloadUrl = doc["url"];
+        const char* expectedMd5 = doc["md5"];  // 必填，缺了會被 startFirmwareUpdate() 擋下
 
         if (newVersion && downloadUrl) {
           Serial.println("收到韌體更新請求");
@@ -793,9 +1061,10 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
           Serial.println(newVersion);
           Serial.print("下載網址：");
           Serial.println(downloadUrl);
+          Serial.printf("MD5：%s\n", expectedMd5 ? expectedMd5 : "(未提供)");
 
           // 開始更新程序
-          startFirmwareUpdate(downloadUrl);
+          startFirmwareUpdate(downloadUrl, expectedMd5);
         }
       }
     } else {
@@ -849,6 +1118,16 @@ void setup()
   initRelayPins();
 
   Serial.begin(115200);
+  // 【沒人讀 USB CDC 時絕不能讓 Serial 卡住】CDCOnBoot=cdc 下 Serial 是 HWCDC。
+  // 電腦曾開過序列埠（監視視窗、esptool）之後，core 3.3.x 的 HWCDC::write() 就把
+  // 鏈路視為 connected；之後關掉監視但 USB 線還插著，isPlugged() 仍為 true，旗標
+  // 永遠翻不回去，每一次 write() 都要等 20 × tx_timeout_ms(100ms) = 2 秒才放棄。
+  // mqttCallback → publishStatus 一路印十幾行，一個指令就卡 35～60 秒，MQTT loop
+  // 跑不到、keepalive 過期、broker 45 秒後用 LWT 踢掉——外觀是「收到指令就斷線、
+  // 一分鐘後自己回來」，開機秒數卻連續（2026-09-10 實測，開著監視就完全正常）。
+  // 現場設備沒接電腦、從未列舉，走的是非阻塞 FIFO 路徑，本來就不受影響；這行是
+  // 讓桌面測試時的行為跟現場一致。逾時設 0：緩衝滿了就丟，不等。
+  Serial.setTxTimeoutMs(0);
   delay(1000); // 等待序列埠穩定
 
   Serial.println("齁控－動物管制遠端控制系統 v" + String(firmwareVersion));
@@ -873,16 +1152,20 @@ void setup()
   digitalWrite(ledOnFace, LOW);  // 關閉 LED
 
   pinMode(bootButton, INPUT_PULLUP);  // 改用 INPUT_PULLUP
-  pinMode(resetButton, INPUT_PULLUP);  // 改用 INPUT_PULLUP
-  delay(50);  // 等內部提升電阻把腳位拉穩再取樣
+
+  // GPIO 1 的 pinMode 由此決定（有分壓模組走 ADC、沒有則退回 INPUT_PULLUP），
+  // 必須早於 checkStuckButtons() —— 自檢是靠 isResetButtonPressed() 取樣的。
+  detectBatterySense();
+  delay(50);  // 等內部提升電阻／分壓網路把腳位拉穩再取樣
 
   checkStuckButtons();  // 必須早於任何重置流程，卡住的腳會在此被排除
+  updateBatteryReading();  // 先量一次，避免上線後的第一筆 status 電量是空的
 
   loadWiFiConfig();
 
   // 讀取使用自訂伺服器標誌
-  EEPROM.begin(128);
-  useCustomServer = (EEPROM.read(96) == 1);
+  EEPROM.begin(EEPROM_SIZE);
+  useCustomServer = (EEPROM.read(EE_USE_CUSTOM) == 1);
   Serial.printf("使用自訂伺服器: %s\n", useCustomServer ? "是" : "否");
 
   const char* deviceId = getDeviceId();  // 獲取設備 ID
@@ -890,8 +1173,16 @@ void setup()
   // 配置 WiFi 設定以提高穩定性
   Serial.println("=== 初始化 WiFi 設定 ===");
   WiFi.onEvent(onWiFiEvent);     // 註冊 WiFi 事件回調（取得斷線原因碼）
-  WiFi.mode(WIFI_STA);           // 先設定模式（ESP32-C3 必須先設定模式再做其他配置）
+
+  // ── persistent(false) 必須排在 mode() 之前，順序不可對調 ──
+  // core 的 WiFiGenericClass::persistent() 只是設一個 _persistent 旗標，真正生效的
+  // 地方是 wifiLowLevelInit()：`if (!_persistent) esp_wifi_set_storage(WIFI_STORAGE_RAM)`。
+  // 而 wifiLowLevelInit() 是被 mode() 觸發的 —— 舊版把 persistent(false) 寫在
+  // mode(WIFI_STA) 後面，driver 早就用預設的 WIFI_STORAGE_FLASH 起來了，
+  // 這行完全沒發揮作用：esp_wifi_set_config() 照樣把 AP 寫進 NVS，
+  // 開機時 driver 也照樣從 NVS 撈舊 AP 出來自動重連（見 clearWiFiConfig() 的說明）。
   WiFi.persistent(false);        // 不將 WiFi 配置寫入 Flash（減少寫入次數，延長壽命）
+  WiFi.mode(WIFI_STA);           // ESP32-C3 必須先設定模式再做其餘配置
   WiFi.setAutoReconnect(true);   // 啟用自動重連（ESP32 底層會嘗試重連）
   WiFi.setSleep(false);          // 禁用 WiFi 睡眠模式（提高穩定性，避免斷線）
 
@@ -934,7 +1225,7 @@ void loop()
   }
   // 讀取按鈕當前狀態（開機診斷判定卡在 LOW 的腳一律視為 HIGH，不參與重置流程）
   bool currentBootState = bootButtonUsable ? digitalRead(bootButton) : HIGH;
-  bool currentResetState = resetButtonUsable ? digitalRead(resetButton) : HIGH;
+  bool currentResetState = (resetButtonUsable && isResetButtonPressed()) ? LOW : HIGH;
 
   // 檢查按鈕是否被按下（從 HIGH 變成 LOW）
   if ((currentBootState == LOW && lastBootButtonState == HIGH) || 
@@ -997,6 +1288,9 @@ void loop()
   // 更新按鈕上次狀態
   lastBootButtonState = currentBootState;
   lastResetButtonState = currentResetState;
+
+  // 電量量測（內部自帶 5 秒間隔限頻，按鈕按住期間會沿用舊值不覆寫）
+  updateBatteryReading();
 
   // 當不在按鈕長按流程時，根據連接狀態控制 LED 閃燈
   if (!isBlinking) {
@@ -1211,6 +1505,20 @@ void connectToWiFi() {
     return;
   }
 
+  // ── 探測期間必須關掉 core 的 auto-reconnect ──
+  //
+  // 開著的話，本函式每一次 WiFi.disconnect() 都會觸發 STA_DISCONNECTED 事件，
+  // core 的 _onStaArduinoEvent 在那個分支會自己 disconnect(); connect(); ——
+  // 跑在 WiFi 事件任務裡，用的是 driver 當下的 config，與本函式前景的
+  // esp_wifi_set_config() + esp_wifi_connect() 直接對撞。
+  // 症狀是每一種 auth 模式都在 4-way handshake 中途被打斷 → 全部收到 reason 15，
+  // 而收尾還原 config 時會撞上 `E wifi:sta is connecting, cannot set config`。
+  //
+  // 這與 1.7.0「不要拆掉 core 的 auto-reconnect」的原則不衝突：那條原則講的是
+  // loop() 的非阻塞重連路徑，不該由韌體接管；而本函式是阻塞式完整探測，
+  // 前景已經在逐一嘗試，背景再插手就只剩互搶。收尾一定要打開回來。
+  WiFi.setAutoReconnect(false);
+
   // 徹底重置 WiFi 狀態（ESP32-C3 需要完整重置才能可靠連線）
   // 注意：第一個參數是 wifioff（關掉射頻），不是 eraseap。
   // 簽章為 disconnect(bool wifioff = false, bool eraseap = false, unsigned long timeoutLength = 100)。
@@ -1412,8 +1720,12 @@ void connectToWiFi() {
   //     重新初始化的 wifiLowLevelInit() 通篇沒有重套它們。
   //     不補這一段，第一次完整探測之後設備就靜默回到預設 modem sleep 與預設發射功率
   //     ——而最容易觸發完整探測的正是訊號邊緣，等於保護在最需要它的場景下被拆掉。
-  //     （setAutoReconnect 不必重套：它寫的是 STAClass::_autoReconnect，
-  //       是全域 WiFi.STA 物件的成員，deinit 後仍然存活。）
+  //
+  // (3) setAutoReconnect(true) 打開回來
+  //     本函式進門時把它關掉了（理由見函式開頭）。它寫的是 STAClass::_autoReconnect，
+  //     是全域 WiFi.STA 物件的成員，deinit 後仍然存活 —— 也就是說**不會自己恢復**，
+  //     漏掉這一行，探測失敗後 loop() 就只剩自家每 10 秒一次的 esp_wifi_connect()
+  //     補刀，AP 回來時的自動重連整個消失。
   if (!connected) {
     wifi_config_t restoreCfg = {};
     memcpy(restoreCfg.sta.ssid, ssid, min(strlen(ssid), sizeof(restoreCfg.sta.ssid)));
@@ -1432,6 +1744,7 @@ void connectToWiFi() {
 
   WiFi.setSleep(false);                  // esp_wifi_set_ps(WIFI_PS_NONE)，deinit 後會失效
   WiFi.setTxPower(WIFI_POWER_19_5dBm);   // esp_wifi_set_max_tx_power()，同上
+  WiFi.setAutoReconnect(true);           // 探測結束，把背景自動重連交還給 core
 
   if (WiFi.status() == WL_CONNECTED) {
     Serial.println("\n✓ WiFi 連接成功！");
@@ -1509,13 +1822,18 @@ void publishStatus() {
   JsonObject device = doc.createNestedObject("device");
   device["relay"] = relayState ? 1 : 0;
   // device["free_heap"] = ESP.getFreeHeap();
-  
+
   if (isUpdating) {
     device["update_progress"] = updateProgress;
   }
-  
+
+  // 電量（沒焊分壓模組的板子不會有這個欄位，App 端要容忍它缺席）。
+  // 約多吃 46 bytes —— PubSubClient 的緩衝區設在 512（見 quickConnectToIndex()
+  // 的說明），加上去之後這份 JSON 約 250 bytes，還有餘裕，但再加欄位前要重算。
+  addBatteryToStatus(doc);
+
   char buffer[1024];  // 將緩衝區大小也增加到 1024
-  
+
   // 計算序列化後的大小
   size_t jsonSize = measureJson(doc);
   Serial.print("JSON 大小: ");
@@ -1576,6 +1894,8 @@ void publishStatusWithServer(const char* server) {
   if (isUpdating) {
     device["update_progress"] = updateProgress;
   }
+
+  addBatteryToStatus(doc);
 
   char buffer[1024];
   serializeJson(doc, buffer);
@@ -1868,13 +2188,54 @@ void connectToMQTT() {
   smartConnect();
 }
 
+// MD5 必須是 32 個十六進位字元，格式不合一律當成沒有
+static bool isValidMd5(const char* s) {
+  if (!s) return false;
+  int n = 0;
+  for (; s[n]; n++) {
+    if (n >= 32) return false;
+    char c = s[n];
+    bool hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+    if (!hex) return false;
+  }
+  return n == 32;
+}
+
 // 韌體下載和更新函數（透過 MQTT 觸發）
-void startFirmwareUpdate(const char* downloadUrl) {
+//
+// ── 為什麼 expectedMd5 是必填 ──
+//
+// 下載走的是 client.setInsecure()，**不驗證 TLS 憑證**，HTTPS 在這條路上只提供加密、
+// 不提供來源鑑別。而舊版收尾寫的是 Update.end(true)：`evenIfRemaining = true` 會跳過
+// 「寫滿了沒」的檢查、直接把 _size 改成已寫入量收工，_verifyEnd() 在沒有設定 MD5 時
+// 只認映像檔開頭那個 0xE9 magic byte。也就是說**只要前幾個位元組像個映像檔，
+// 後面全錯也會被接受**，otadata 照樣切過去 —— 重開機直接開不起來。
+//
+// 而這塊板子的 MOS gate 沒有下拉電阻（見 ho_relay2/readme.md 與
+// .claude/rules/relay-stuck-on-diagnosis.md）：晶片一沒跑使用者程式，繼電器就恆閉合。
+// 也就是說 OTA 失敗的表現是「捕捉籠的門恆開」，這是最危險的失效方向。
+// 2026-09-09 實測：同一份原始碼 USB 燒進去一切正常，OTA 傳下去就開不起來且繼電器恆開。
+//
+// 設了 MD5 之後，Update.end() 會逐位元組比對，不符就整個作廢、**otadata 不切換**，
+// 設備維持在原本跑得好好的韌體上。失效方向從「變磚 + 門恆開」變成「更新沒成功，繼續運作」。
+void startFirmwareUpdate(const char* downloadUrl, const char* expectedMd5) {
   if (isUpdating) {
     Serial.println("更新已在進行中，無法開始新的更新");
     return;
   }
-  
+
+  if (!isValidMd5(expectedMd5)) {
+    Serial.println("✗ 拒絕更新：缺少合法的 MD5（需 32 個十六進位字元）");
+    Serial.println("  下載不驗證 TLS 憑證，MD5 是唯一能確認映像檔沒壞、沒被掉包的依據。");
+    Serial.println("  請在 Firestore 的 firmware_updates/{model} 補上 md5 欄位。");
+    if (mqttClient.connected()) {
+      String deviceId = getDeviceId();
+      String statusTopic = "hoban/" + deviceId + "/status";
+      mqttClient.publish(statusTopic.c_str(), "update_rejected_no_md5", true);
+    }
+    return;
+  }
+
   Serial.println("=== 開始韌體下載更新 ===");
   Serial.printf("下載網址：%s\n", downloadUrl);
   Serial.printf("可用空間：%u bytes\n", ESP.getFreeSketchSpace());
@@ -1947,6 +2308,15 @@ void startFirmwareUpdate(const char* downloadUrl) {
           Serial.printf("錯誤：無法開始更新，錯誤碼：%d\n", Update.getError());
           break;
         }
+
+        // 交給 Update 在 end() 時逐位元組比對。必須排在 begin() 之後：
+        // begin() 會重置內部的 MD5 狀態，順序反了設定會被清掉。
+        if (!Update.setMD5(expectedMd5)) {
+          Serial.println("錯誤：Update.setMD5() 被拒絕，放棄本次更新");
+          Update.abort();
+          break;
+        }
+        Serial.printf("已設定預期 MD5：%s\n", expectedMd5);
         
         WiFiClient* stream = http.getStreamPtr();
         size_t written = 0;
@@ -1992,19 +2362,41 @@ void startFirmwareUpdate(const char* downloadUrl) {
           delay(1); // 避免看門狗重置
         }
         
-        if (written == contentLength && Update.end(true)) {
-          Serial.println("更新成功！準備重新啟動...");
+        // ── 收尾一律走 Update.end()，不要傳 true ──
+        //
+        // end(evenIfRemaining = true) 會跳過「寫滿了沒」的檢查、把 _size 改成已寫入量
+        // 直接收工。配合「沒設 MD5 時 _verifyEnd() 只檢查開頭的 0xE9」，等於截斷或
+        // 內容損毀的映像檔照樣會被接受並切換 otadata。現在 MD5 是必填、長度也先檢查過，
+        // 沒有任何理由再放寬。
+        if (written == contentLength && Update.end()) {
+          Serial.println("更新成功（MD5 驗證通過）！準備重新啟動...");
           downloadSuccess = true;
-          
+
           if (mqttClient.connected()) {
             String deviceId = getDeviceId();
             String statusTopic = "hoban/" + deviceId + "/status";
             mqttClient.publish(statusTopic.c_str(), "update_success", true);
           }
-          
+
           delay(1000);
           ESP.restart();
           return;
+        }
+
+        // 走到這裡代表下載不完整或 MD5 不符。一定要 abort()：
+        // 不 abort 的話 Update 內部仍持有分區狀態，下一輪 retry 的 begin() 會失敗，
+        // 而且已寫入的半套映像檔留在 OTA 分區裡。abort() 後 otadata **不會**切換，
+        // 設備維持在現有韌體上繼續運作。
+        Serial.printf("✗ 更新失敗：已寫入 %u/%d bytes，Update 錯誤碼 %d\n",
+                      written, contentLength, Update.getError());
+        if (Update.getError() == UPDATE_ERROR_MD5) {
+          Serial.println("  MD5 不符 —— 下載到的映像檔與發佈的不是同一份，已整份作廢");
+        }
+        Update.abort();
+        if (mqttClient.connected()) {
+          String deviceId = getDeviceId();
+          String statusTopic = "hoban/" + deviceId + "/status";
+          mqttClient.publish(statusTopic.c_str(), "update_failed", true);
         }
       } else if (httpCode == HTTP_CODE_FOUND || httpCode == HTTP_CODE_MOVED_PERMANENTLY) {
         // 處理重定向
