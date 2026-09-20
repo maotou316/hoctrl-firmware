@@ -12,7 +12,7 @@
 #include <WiFiClientSecure.h>  // 添加 WiFiClientSecure 庫
 #include <esp_wifi.h>          // ESP32 WiFi 底層 API（PMF 設定等）
 
-const char* firmwareVersion = "1.8.3"; // 當前韌體版本
+const char* firmwareVersion = "1.8.5"; // 當前韌體版本
 // uPesy ESP32 WROOM DevKit
 // LED 閃爍模式定義
 const unsigned long SHORT_BLINK = 200;  // 短閃持續時間 (毫秒)
@@ -94,7 +94,8 @@ const float BATTERY_SCALE = 5.0f;                 // 模組原廠分壓比
 const int BATTERY_OFFSET_MV = 0;
 #endif
 
-const int BATTERY_BUTTON_MV = 500;    // ADC 低於此值 → 判定 RESET 按鈕按下
+const int BATTERY_BUTTON_MV = 500;    // ADC 低於此值 → 疑似 RESET 按鈕按下，要再開上拉確認
+const int BATTERY_SHORT_MV = 250;     // 開內部上拉後仍低於此值 → 真的被按鈕短路到地（見 isResetButtonPressed()）
 const int BATTERY_OPEN_MV = 2500;     // ADC 高於此值 → 判定分壓模組脫落／量測異常
 const int BATTERY_SAMPLES = 8;        // 電量量測的取樣次數（按鈕偵測只取 1 次，不能拖慢 loop）
 const unsigned long BATTERY_READ_INTERVAL_MS = 5000;  // 電量重新量測的間隔
@@ -187,9 +188,9 @@ struct MqttServerConfig {
   const char* password;
 };
 
+// 與 App multi_mqtt_service.dart 一致；broker.hoban.tw 2026-09-19 移除（帳密佔位符）
 const MqttServerConfig DEFAULT_SERVERS[] = {
   {"mqttgo.io",               1883, NULL,         NULL},
-  {"broker.hoban.tw",         1883, "hoban_user", "hoban_pass"},
   {"mqtt.eclipseprojects.io", 1883, NULL,         NULL},
   {"broker.emqx.io",          1883, NULL,         NULL},
   {"broker.hivemq.com",       1883, NULL,         NULL},
@@ -452,6 +453,15 @@ void detectBatterySense() {
     int senseMv = readSenseMilliVolts(BATTERY_SAMPLES);
     Serial.printf("電量檢測: 已啟用（GPIO %d 走 ADC，兼作 RESET 按鈕；偵測 %d mV，分壓 %d mV → 電池約 %d mV）\n",
                   batterySensePin, detectMv, senseMv, senseToBatteryMilliVolts(senseMv));
+    // 這筆直接寫進電量狀態，當作第一次量測。
+    // 不能靠 setup() 之後呼叫 updateBatteryReading()：它有 5 秒限頻，而 lastBatteryReadTime
+    // 初值是 0、此時 millis() 才 1 秒多，必定被擋掉，第一筆 retained 上線 status／
+    // server_changed 的 battery 會是 {mv:0, percent:-1, valid:false}。
+    if (senseMv >= BATTERY_BUTTON_MV && senseMv <= BATTERY_OPEN_MV) {
+      lastBatteryMilliVolts = senseToBatteryMilliVolts(senseMv);
+      lastBatteryPercent = batteryPercentFromMilliVolts(lastBatteryMilliVolts);
+      lastBatteryReadTime = millis();
+    }
   } else {
     pinMode(batterySensePin, INPUT_PULLUP);
     Serial.printf("電量檢測: 未偵測到分壓模組（開下拉後偵測 %d mV，門檻 %d mV），GPIO %d 退回按鈕模式\n",
@@ -511,12 +521,46 @@ int batteryPercentFromMilliVolts(int mv) {
 }
 
 // RESET 按鈕是否被按下。
-// ADC 模式只取樣一次：這個函式在 loop 每一圈都會跑，8 次取樣會拖慢整個迴圈。
+// ADC 模式先只取樣一次：這個函式在 loop 每一圈都會跑，8 次取樣會拖慢整個迴圈。
+//
+// 【讀到低電壓不能直接當成按鈕】
+// 運行中「電池斷開」（BMS 低壓斷電、接頭鬆脫、桌測 USB 供電時拔電池）時，S 腳只剩
+// 模組下臂 7.5kΩ 通到地，ADC 一樣讀 ≈0 mV——單看電壓和按鈕短路到地分不出來。
+// 1.8.3 以前這裡直接回 true，等於有人長按 RESET，5 秒後 clearWiFiConfig() 把綁定清光、
+// 設備重啟進 BLE 配對模式，之後電源／分享器怎麼回來都不會再上線
+// （2026-09 現場一台「分享器停電後再也連不上」疑似就是這條路）。
+//
+// 分辨法：開內部上拉（約 45kΩ）再讀一次。
+//   按鈕短路到地                  → 仍是 ≈0 mV（上拉推不動 0Ω）
+//   7.5kΩ 通到地（電池斷開）       → 3300 × 7.5/(45+7.5) ≈ 470 mV，即開機指紋「模組沒電 ≈0/470」
+//   腳浮空（模組脫落、沒焊 100k 上拉）→ ≈1.9～2.2 V（100nF 配 45k 上拉 τ≈4.5 ms，5 ms 只充到六成）
+// 只有第一種才是按鈕。上拉只在低讀值時短暫開啟，正常量電壓的路徑完全不受影響；
+// 5 ms 的餘裕是以 S 腳 100nF 為前提：7.5k 路徑 τ≈0.64 ms 綽綽有餘，
+// 但若焊成 1µF，τ≈6.4 ms、5 ms 後只有 ≈254 mV，貼著 250 門檻，換電容要重算。
+// 順帶把 rules 檔原本列在「擋不住」的「沒焊 100k 上拉時模組脫落浮空」也擋掉了：
+// 浮空腳開上拉 5 ms 至少 1.9 V，遠高於 250，不會再被當成按鈕。
 bool isResetButtonPressed() {
   if (!batterySenseAvailable) {
     return digitalRead(batterySensePin) == LOW;
   }
-  return analogReadMilliVolts(batterySensePin) < BATTERY_BUTTON_MV;
+  if (analogReadMilliVolts(batterySensePin) >= BATTERY_BUTTON_MV) return false;
+
+  gpio_pullup_en((gpio_num_t)batterySensePin);
+  delay(5);
+  int pullupMv = analogReadMilliVolts(batterySensePin);
+  gpio_pullup_dis((gpio_num_t)batterySensePin);
+
+  bool pressed = (pullupMv < BATTERY_SHORT_MV);
+  if (!pressed) {
+    // 電池斷開期間 loop 每圈都會走到這裡，限頻印一次，讓現場接序列埠看得出來是什麼狀態
+    static unsigned long lastNotButtonWarn = 0;
+    if (lastNotButtonWarn == 0 || millis() - lastNotButtonWarn > 60000) {
+      lastNotButtonWarn = millis();
+      Serial.printf("⚠ 電量檢測: GPIO %d 讀值 <%d mV 但開上拉後為 %d mV，不是按鈕（電池斷開或模組脫落？），不觸發重置\n",
+                    batterySensePin, BATTERY_BUTTON_MV, pullupMv);
+    }
+  }
+  return pressed;
 }
 
 // 定期更新電池讀值。按鈕按住時腳被拉到地、模組脫落時讀值飄高，
@@ -560,18 +604,25 @@ void checkStuckButtons() {
     delay(BTN_SELFTEST_INTERVAL);
   }
 
-  bootButtonUsable = (bootLowCount < totalSamples);
-  resetButtonUsable = (resetLowCount < totalSamples);
+  bool bootStuck = (bootLowCount >= totalSamples);
+  bool resetStuck = (resetLowCount >= totalSamples);
 
-  if (bootButtonUsable && resetButtonUsable) {
+  // 只能「往停用的方向」改，不能整個覆寫。detectBatterySense() 可能已因
+  // 「模組接了但沒供電」（開上拉 <2000 mV）先把 RESET 停用了；那個讀值在 0.8～2.0V
+  // 是數位輸入的灰色地帶，10 次取樣只要抖一次 HIGH，`resetButtonUsable = (count < total)`
+  // 就會把保護翻回可用，之後 loop 連續 5 秒 LOW 照樣清光 WiFi 設定。
+  if (bootStuck) bootButtonUsable = false;
+  if (resetStuck) resetButtonUsable = false;
+
+  if (!bootStuck && !resetStuck) {
     Serial.println("按鈕自檢: 正常");
     return;
   }
 
-  if (!bootButtonUsable) {
+  if (bootStuck) {
     Serial.printf("⚠ 按鈕自檢: BOOT(GPIO %d) 恆為 LOW，本次開機停用其重置功能\n", bootButton);
   }
-  if (!resetButtonUsable) {
+  if (resetStuck) {
     Serial.printf("⚠ 按鈕自檢: RESET(GPIO %d) 恆為 LOW，本次開機停用其重置功能\n", resetButton);
   }
   Serial.println("  若非按住按鈕開機，代表該腳短路或未接，請檢查硬體");
@@ -1159,7 +1210,8 @@ void setup()
   delay(50);  // 等內部提升電阻／分壓網路把腳位拉穩再取樣
 
   checkStuckButtons();  // 必須早於任何重置流程，卡住的腳會在此被排除
-  updateBatteryReading();  // 先量一次，避免上線後的第一筆 status 電量是空的
+  // 第一筆電量由 detectBatterySense() 直接寫入。這裡以前呼叫 updateBatteryReading()，
+  // 但它的 5 秒限頻在開機 1 秒多時必定擋掉，那行從來沒有生效過。
 
   loadWiFiConfig();
 
