@@ -12,7 +12,7 @@
 #include <WiFiClientSecure.h>  // 添加 WiFiClientSecure 庫
 #include <esp_wifi.h>          // ESP32 WiFi 底層 API（PMF 設定等）
 
-const char* firmwareVersion = "1.8.5"; // 當前韌體版本
+const char* firmwareVersion = "1.9.0"; // 當前韌體版本
 // uPesy ESP32 WROOM DevKit
 // LED 閃爍模式定義
 const unsigned long SHORT_BLINK = 200;  // 短閃持續時間 (毫秒)
@@ -154,6 +154,14 @@ const unsigned long WIFI_FULL_PROBE_COOLDOWN_MS = 120000;  // 兩次完整探測
 const unsigned long WIFI_STATUS_PRINT_MS = 60000;          // 定期印出 WiFi 狀態的間隔
 const unsigned long WIFI_SCAN_TIMEOUT_MS = 8000;           // scanNetworks() 的上限（core 預設 60 秒）
 
+// ── WiFi 省電：Modem-sleep 開關（試驗中）──
+// 1 = WIFI_PS_MIN_MODEM：射頻只在每個 DTIM beacon 醒來看有沒有自己的封包，其餘時間關閉。
+//     待機電流約 90mA → 25~35mA（2S 3200mAh 待機由約 1 天拉到數天），
+//     代價是收指令多 100~300ms 延遲，且部分路由器對睡眠中設備處理不良會提早踢線。
+// 0 = WIFI_PS_NONE：射頻常開，舊版行為（1.8.5 以前一律如此，理由是避免斷線）。
+// 實機驗證斷線率沒變差之前，若現場回報掉線變多，先改回 0 再查。
+#define WIFI_MODEM_SLEEP 1
+
 // WiFi 斷線原因碼（用於診斷）
 volatile uint8_t lastWifiDisconnectReason = 0;
 
@@ -246,6 +254,7 @@ void detectBatterySense();
 bool isResetButtonPressed();
 void updateBatteryReading();
 void addBatteryToStatus(JsonDocument& doc);
+void applyWiFiPowerSettings();
 
 // ── EEPROM 佈局 ──
 //
@@ -1236,14 +1245,11 @@ void setup()
   WiFi.persistent(false);        // 不將 WiFi 配置寫入 Flash（減少寫入次數，延長壽命）
   WiFi.mode(WIFI_STA);           // ESP32-C3 必須先設定模式再做其餘配置
   WiFi.setAutoReconnect(true);   // 啟用自動重連（ESP32 底層會嘗試重連）
-  WiFi.setSleep(false);          // 禁用 WiFi 睡眠模式（提高穩定性，避免斷線）
-
-  // 設定 WiFi 電源模式為最大性能（犧牲一點耗電換取穩定性）
-  WiFi.setTxPower(WIFI_POWER_19_5dBm);  // 設定最大發射功率
+  applyWiFiPowerSettings();      // 睡眠模式與發射功率（見 WIFI_MODEM_SLEEP）
 
   Serial.printf("WiFi 模式: STA (Station)\n");
   Serial.printf("自動重連: 啟用\n");
-  Serial.printf("睡眠模式: 禁用\n");
+  Serial.printf("睡眠模式: %s\n", WIFI_MODEM_SLEEP ? "Modem-sleep (MIN_MODEM)" : "禁用");
   Serial.printf("發射功率: 19.5dBm (最大)\n");
 
   if (strlen(ssid) > 0) {
@@ -1550,6 +1556,13 @@ void loop()
   }
 }
 
+// 睡眠模式與發射功率都寫在驅動層，esp_wifi_deinit() 後會被清掉，
+// 所以開機與 connectToWiFi() 收尾都要呼叫；OTA 失敗後也用它還原（OTA 期間強制不睡）。
+void applyWiFiPowerSettings() {
+  WiFi.setSleep(WIFI_MODEM_SLEEP ? true : false);  // true → WIFI_PS_MIN_MODEM；false → WIFI_PS_NONE
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+}
+
 void connectToWiFi() {
   // 檢查當前狀態
   if (WiFi.status() == WL_CONNECTED) {
@@ -1766,12 +1779,13 @@ void connectToWiFi() {
   //     舊版每 5 秒重跑本函式，等於每 5 秒把模式 1 重新套上一次（隱性還原）；
   //     新版呼叫頻率大幅降低，這個還原必須顯式做。
   //
-  // (2) setSleep(false) 與 setTxPower() 重套
+  // (2) 睡眠模式與 setTxPower() 重套（applyWiFiPowerSettings()）
   //     這兩者是寫進驅動層的（esp_wifi_set_ps() / esp_wifi_set_max_tx_power()），
   //     而本函式開頭的 WiFi.disconnect(true) 一路走到 esp_wifi_deinit()，
   //     重新初始化的 wifiLowLevelInit() 通篇沒有重套它們。
-  //     不補這一段，第一次完整探測之後設備就靜默回到預設 modem sleep 與預設發射功率
+  //     不補這一段，第一次完整探測之後設備就靜默回到 core 的預設睡眠與預設發射功率
   //     ——而最容易觸發完整探測的正是訊號邊緣，等於保護在最需要它的場景下被拆掉。
+  //     （WIFI_MODEM_SLEEP=1 時睡眠模式剛好與預設相同，但發射功率仍必須重套。）
   //
   // (3) setAutoReconnect(true) 打開回來
   //     本函式進門時把它關掉了（理由見函式開頭）。它寫的是 STAClass::_autoReconnect，
@@ -1794,8 +1808,7 @@ void connectToWiFi() {
     }
   }
 
-  WiFi.setSleep(false);                  // esp_wifi_set_ps(WIFI_PS_NONE)，deinit 後會失效
-  WiFi.setTxPower(WIFI_POWER_19_5dBm);   // esp_wifi_set_max_tx_power()，同上
+  applyWiFiPowerSettings();              // esp_wifi_set_ps() 與 set_max_tx_power()，deinit 後會失效
   WiFi.setAutoReconnect(true);           // 探測結束，把背景自動重連交還給 core
 
   if (WiFi.status() == WL_CONNECTED) {
@@ -2295,6 +2308,9 @@ void startFirmwareUpdate(const char* downloadUrl, const char* expectedMd5) {
 
   isUpdating = true;
   updateProgress = 0;
+  // 下載期間射頻常開：Modem-sleep 會讓大量下行資料每個 DTIM 才取一次，
+  // 下載慢數倍、也更容易撞上 http.setTimeout()。成功會直接 restart，失敗在函式尾端還原。
+  WiFi.setSleep(false);
   // LED 開始快閃（更新模式）
   digitalWrite(ledOnFace, LOW);
   digitalWrite(ledOnBoard, LOW);
@@ -2489,6 +2505,7 @@ void startFirmwareUpdate(const char* downloadUrl, const char* expectedMd5) {
   
   // 更新失敗處理
   isUpdating = false;
+  applyWiFiPowerSettings();  // 還原 OTA 開頭強制關掉的睡眠模式
   digitalWrite(ledOnFace, LOW);
   digitalWrite(ledOnBoard, LOW);
   
