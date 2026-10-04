@@ -11,8 +11,9 @@
 #include <HTTPClient.h>   // 添加 HTTPClient 庫
 #include <WiFiClientSecure.h>  // 添加 WiFiClientSecure 庫
 #include <esp_wifi.h>          // ESP32 WiFi 底層 API（PMF 設定等）
+#include <MD5Builder.h>         // 隨身 WiFi 管理頁的 HTTP Digest 認證
 
-const char* firmwareVersion = "1.9.3"; // 當前韌體版本
+const char* firmwareVersion = "1.11.4"; // 當前韌體版本
 // uPesy ESP32 WROOM DevKit
 // LED 閃爍模式定義
 const unsigned long SHORT_BLINK = 200;  // 短閃持續時間 (毫秒)
@@ -254,6 +255,10 @@ void detectBatterySense();
 bool isResetButtonPressed();
 void updateBatteryReading();
 void addBatteryToStatus(JsonDocument& doc);
+void pollMifi();
+void addMifiToStatus(JsonDocument& doc);
+void publishMifiStatus();
+String mifiDeviceId();
 void applyWiFiPowerSettings();
 
 // ── EEPROM 佈局 ──
@@ -594,6 +599,360 @@ void addBatteryToStatus(JsonDocument& doc) {
   battery["mv"] = lastBatteryMilliVolts;
   battery["percent"] = lastBatteryPercent;
   battery["valid"] = (lastBatteryPercent >= 0);
+}
+
+// ── 隨身 WiFi（MiFi）電量讀取 ──
+//
+// 野外時設備連的是 LTE 隨身 WiFi。Marvell/ASR 方案的機種（預設帳密 admin/admin）
+// 可以從管理頁的 status1 XML 讀到它自己的電池狀態，讀得到就放進 status JSON 的
+// "mifi" 物件；讀不到（不是這種機種、帳密被改）就不帶，App 端必須容忍這個物件缺席。
+//
+// 管理頁位址一律用「目前 WiFi 的閘道」，不寫死 IP：同方案的機器預設多半是
+// 192.168.100.1，但使用者可以改，不同品牌也不一定一樣。
+// 任何網路都會試，不是這種機種（家用路由器等）會在第一個請求就失敗
+// （沒有 WWW-Authenticate 或 404），之後 10 分鐘才再試一次，成本很低。
+// 換了 AP（BSSID 或閘道變了）就清掉舊資料與 session 重新來過。
+// HTTP 是阻塞的。連線逾時 2 秒（不支援的設備很快失敗），讀取逾時 8 秒：
+// 實測（2026-10-04，realm "Highwmg" 機種）status1 要 1.6～1.9 秒才回，1.10.3 以前讀取也設 2 秒，
+// 加上 Modem-sleep 的收包延遲就超時，永遠讀不到。最壞一輪（登入 2 次請求 + 讀取，失敗再重登重讀）
+// 約 24 秒，仍在 MQTT keepAlive 30 秒（broker 45 秒才踢）之內。
+//
+// 認證流程（機器的 Digest 實作有自己的規矩，照抄，不要「修正」成標準 Digest）：
+//   1. GET /login.cgi 取 WWW-Authenticate 的 realm/nonce/qop
+//   2. GET /login.cgi?Action=Digest&...，HA2 = md5("GET:/cgi/protected.cgi")，nc 固定 00000001；
+//      這個請求本身也要帶第 3 步格式的 Authorization（nc=00000001），否則 session 不成立
+//   3. GET /xml_action.cgi?...，Authorization 的 uri 固定寫 /cgi/xml_action.cgi（不是實際路徑），
+//      nonce 沿用登入那個，nc 每個請求加 1（登入用掉 1，第一次讀取是 00000002）
+// session 約 10 分鐘逾時，逾時後讀取回 200 但 body 是空的（不回 401），
+// 所以「找不到 Battery_connect」就重新登入再試一次。有人用瀏覽器登入管理頁會互踢，同一套機制涵蓋。
+const char* MIFI_USER = "admin";
+const char* MIFI_PASS = "admin";
+const unsigned long MIFI_POLL_INTERVAL_MS = 60000;      // 讀到過資料：每分鐘一次（電量只有分段變化）
+const unsigned long MIFI_PROBE_INTERVAL_MS = 600000;    // 從沒讀到過：10 分鐘再試（多半不是這種機種）
+const uint16_t MIFI_CONNECT_TIMEOUT_MS = 2000;
+const uint16_t MIFI_READ_TIMEOUT_MS = 8000;
+const int MIFI_STALE_FAILS = 3;                         // 連續失敗幾次就把 valid 標成 false
+// 回應大小上限。status1 XML 實際只有幾 KB；不支援的設備（例如攔截網頁的公共 WiFi）
+// 可能對任何網址都回一大頁 HTML，不設上限會把整頁讀進記憶體
+const size_t MIFI_MAX_BODY = 16384;
+
+String mifiHost;                      // "http://{閘道 IP}"，換網路時更新
+String mifiNetKey;                    // 目前這台 AP 的識別（BSSID + 閘道），變了就重來
+String mifiRealm, mifiNonce, mifiQop, mifiHa1;
+uint32_t mifiNc = 0;
+bool mifiLoggedIn = false;
+bool mifiHasData = false;             // 本次連上這台隨身 WiFi 後是否讀到過資料
+int mifiBatConnect = -1;              // Battery_connect：0 無電池，1 有
+String mifiBatLevel;                  // Battery_voltage：分段字串（例如 ">20"），機器不給精確數字
+int mifiPowerIn = -1;                 // Battery_charging：0 沒插電
+int mifiChargeState = -1;             // Battery_charge：0 未充電，1 充電中，2 已充滿
+String mifiFwVersion;                 // 分享器自己的韌體版本（sysinfo 的 version_num），讀不到為空
+unsigned long mifiLastOkAt = 0;
+int mifiFailCount = 0;
+unsigned long mifiNextPollAt = 0;     // 0 = 立刻可試
+
+static String md5Hex(const String& s) {
+  MD5Builder md5;
+  md5.begin();
+  md5.add(s);
+  md5.calculate();
+  return md5.toString();  // 小寫 hex
+}
+
+static String mifiCnonce() {
+  return md5Hex(String(esp_random()) + String(millis())).substring(0, 16);
+}
+
+// 從 WWW-Authenticate 取出 key 的值，容許 key="v" 與 key=v 兩種寫法
+static String digestParam(const String& header, const char* key) {
+  String k = String(key) + "=";
+  int i = header.indexOf(k);
+  if (i < 0) return "";
+  i += k.length();
+  if (i < (int)header.length() && header[i] == '"') {
+    int end = header.indexOf('"', i + 1);
+    return end < 0 ? "" : header.substring(i + 1, end);
+  }
+  int end = header.indexOf(',', i);
+  String v = end < 0 ? header.substring(i) : header.substring(i, end);
+  v.trim();
+  return v;
+}
+
+static String urlEncode(const String& s) {
+  const char* hex = "0123456789ABCDEF";
+  String out;
+  for (size_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    if (isalnum((unsigned char)c) || c == '-' || c == '_' || c == '.' || c == '~') {
+      out += c;
+    } else {
+      out += '%';
+      out += hex[(c >> 4) & 0x0F];
+      out += hex[c & 0x0F];
+    }
+  }
+  return out;
+}
+
+// 取 <tag>值</tag>，找不到回 false。值裡的 XML 跳脫字元（例如 &gt;20）還原成原字
+static bool xmlTagValue(const String& body, const char* tag, String& out) {
+  String open = String("<") + tag + ">";
+  int i = body.indexOf(open);
+  if (i < 0) return false;
+  i += open.length();
+  int end = body.indexOf(String("</") + tag + ">", i);
+  if (end < 0) return false;
+  out = body.substring(i, end);
+  out.replace("&gt;", ">");
+  out.replace("&lt;", "<");
+  out.replace("&amp;", "&");
+  out.trim();
+  return true;
+}
+
+// 只收前 cap bytes 的 Stream，滿了就讓 write() 回 0，
+// HTTPClient::writeToStream() 會因此中止並回 HTTPC_ERROR_STREAM_WRITE。
+// 用 writeToStream() 而不是自己讀 getStreamPtr()，是因為前者會處理 chunked 編碼
+class CappedStringStream : public Stream {
+ public:
+  CappedStringStream(String& out, size_t cap) : out_(out), cap_(cap) {}
+  size_t write(uint8_t c) override {
+    if (out_.length() >= cap_) return 0;
+    out_ += (char)c;
+    return 1;
+  }
+  size_t write(const uint8_t* buf, size_t n) override {
+    if (out_.length() + n > cap_) return 0;
+    out_.concat((const char*)buf, n);
+    return n;
+  }
+  int available() override { return 0; }
+  int read() override { return -1; }
+  int peek() override { return -1; }
+  void flush() override {}
+
+ private:
+  String& out_;
+  size_t cap_;
+};
+
+// 產生 xml_action.cgi 用的 Digest Authorization，每呼叫一次 nc 加 1。
+// 照抄管理頁 js/base/utils.js 的 getAuthHeader()：uri 固定 /cgi/xml_action.cgi
+static String mifiAuthHeader() {
+  mifiNc++;
+  char nc[9];
+  snprintf(nc, sizeof(nc), "%08x", (unsigned)mifiNc);
+  String cnonce = mifiCnonce();
+  String ha2 = md5Hex("GET:/cgi/xml_action.cgi");
+  String res = md5Hex(mifiHa1 + ":" + mifiNonce + ":" + nc + ":" + cnonce + ":" + mifiQop + ":" + ha2);
+  return String("Digest username=\"") + MIFI_USER + "\", realm=\"" + mifiRealm +
+         "\", nonce=\"" + mifiNonce + "\", uri=\"/cgi/xml_action.cgi\", response=\"" + res +
+         "\", qop=" + mifiQop + ", nc=" + nc + ", cnonce=\"" + cnonce + "\"";
+}
+
+static bool mifiLogin() {
+  mifiLoggedIn = false;
+  WiFiClient client;
+  HTTPClient http;
+  http.setConnectTimeout(MIFI_CONNECT_TIMEOUT_MS);
+  http.setTimeout(MIFI_READ_TIMEOUT_MS);
+
+  // 1. 取 challenge。HTTPClient 不先 collectHeaders() 就拿不到 WWW-Authenticate
+  if (!http.begin(client, mifiHost + "/login.cgi")) return false;
+  const char* wanted[] = {"WWW-Authenticate"};
+  http.collectHeaders(wanted, 1);
+  int code = http.GET();
+  String auth = http.header("WWW-Authenticate");
+  http.end();
+  if (code <= 0 || auth.length() == 0) {
+    Serial.printf("MiFi：取 challenge 失敗（HTTP %d）\n", code);
+    return false;
+  }
+  mifiRealm = digestParam(auth, "realm");
+  mifiNonce = digestParam(auth, "nonce");
+  mifiQop = digestParam(auth, "qop");
+  if (mifiQop.length() == 0) mifiQop = "auth";
+  if (mifiRealm.length() == 0 || mifiNonce.length() == 0) {
+    Serial.println("MiFi：WWW-Authenticate 缺 realm/nonce，不是支援的機種");
+    return false;
+  }
+
+  // 2. 登入
+  mifiHa1 = md5Hex(String(MIFI_USER) + ":" + mifiRealm + ":" + MIFI_PASS);
+  String ha2 = md5Hex("GET:/cgi/protected.cgi");
+  String cnonce = mifiCnonce();
+  String res = md5Hex(mifiHa1 + ":" + mifiNonce + ":00000001:" + cnonce + ":" + mifiQop + ":" + ha2);
+  String url = mifiHost + "/login.cgi?Action=Digest&username=" + MIFI_USER +
+               "&realm=" + urlEncode(mifiRealm) + "&nonce=" + urlEncode(mifiNonce) +
+               "&response=" + res + "&qop=" + mifiQop + "&cnonce=" + cnonce + "&temp=asr";
+  if (!http.begin(client, url)) return false;
+  // 登入請求本身也要帶 Authorization（nc=00000001）。原始規格沒寫這條，
+  // 但管理頁 js/base/ajax_calls.js 的 authentication() 有帶；沒帶的話登入照樣回 200，
+  // session 卻不成立，之後讀 status1 只拿到 <login_status>UNAUTHORIZED</login_status>
+  // （2026-10-04 實機查到）。之前從電腦測會成功，是沿用了瀏覽器的 session。
+  mifiNc = 0;
+  http.addHeader("Authorization", mifiAuthHeader());
+  code = http.GET();
+  http.end();
+  if (code != 200) {
+    Serial.printf("MiFi：登入失敗（HTTP %d）\n", code);
+    return false;
+  }
+  mifiLoggedIn = true;
+  return true;
+}
+
+// 讀 status1 並解析電池欄位。找不到 Battery_connect（session 過期回空 body）就回 false
+static bool mifiFetchStatus() {
+  String authHeader = mifiAuthHeader();
+
+  WiFiClient client;
+  HTTPClient http;
+  http.setConnectTimeout(MIFI_CONNECT_TIMEOUT_MS);
+  http.setTimeout(MIFI_READ_TIMEOUT_MS);
+  if (!http.begin(client, mifiHost + "/xml_action.cgi?method=get&module=duster&file=status1")) {
+    return false;
+  }
+  http.addHeader("Authorization", authHeader);
+  int code = http.GET();
+  String body;
+  if (code == 200) {
+    int size = http.getSize();  // -1 = 沒有 Content-Length（chunked 等），交給 CappedStringStream 擋
+    if (size > (int)MIFI_MAX_BODY) {
+      Serial.printf("MiFi：回應 %d bytes 超過上限，不讀\n", size);
+    } else {
+      CappedStringStream sink(body, MIFI_MAX_BODY);
+      if (http.writeToStream(&sink) < 0) {
+        Serial.println("MiFi：回應讀取中止（超過上限或連線中斷）");
+        body = "";
+      }
+    }
+  }
+  http.end();
+
+  String connect, level, charging, charge;
+  if (!xmlTagValue(body, "Battery_connect", connect)) return false;
+  xmlTagValue(body, "Battery_voltage", level);
+  mifiBatConnect = connect.toInt();
+  mifiBatLevel = level;
+  mifiPowerIn = xmlTagValue(body, "Battery_charging", charging) ? charging.toInt() : -1;
+  mifiChargeState = xmlTagValue(body, "Battery_charge", charge) ? charge.toInt() : -1;
+  String fw;
+  mifiFwVersion = xmlTagValue(body, "version_num", fw) ? fw : String();
+  return true;
+}
+
+static bool mifiReadOnce() {
+  if (!mifiLoggedIn && !mifiLogin()) return false;
+  if (mifiFetchStatus()) return true;
+  // session 過期或被瀏覽器登入踢掉：重新登入再試一次
+  if (!mifiLogin()) return false;
+  return mifiFetchStatus();
+}
+
+void pollMifi() {
+  // 韌體更新中、或使用者正按著重置鍵時不阻塞 loop
+  if (isUpdating || buttonPressTime != 0) return;
+
+  IPAddress gw = WiFi.gatewayIP();
+  if (gw == IPAddress(0, 0, 0, 0)) return;  // DHCP 還沒拿到閘道
+
+  String netKey = WiFi.BSSIDstr() + "/" + gw.toString();
+  if (netKey != mifiNetKey) {
+    // 換到別台 AP：清掉舊資料，免得把上一台隨身 WiFi 的電量當成現在的
+    mifiNetKey = netKey;
+    mifiHost = String("http://") + gw.toString();
+    mifiHasData = false;
+    mifiLoggedIn = false;
+    mifiFailCount = 0;
+    mifiNextPollAt = 0;
+  }
+
+  if (mifiNextPollAt != 0 && (long)(millis() - mifiNextPollAt) < 0) return;
+
+  bool ok = mifiReadOnce();
+
+  // 讀取最長阻塞約 24 秒，期間可能斷線或漫遊到別台 AP。身分變了就整筆作廢，
+  // 不然會把這台的電量掛到另一台分享器的 ID 下（或斷線時 BSSID 全 0 的 mifi-000000000000）。
+  // 不設 mifiNextPollAt：下一輪 loop 會因 netKey 不同而重置狀態並馬上重讀。
+  if (WiFi.status() != WL_CONNECTED ||
+      WiFi.BSSIDstr() + "/" + WiFi.gatewayIP().toString() != mifiNetKey) {
+    Serial.println("MiFi：讀取期間網路已變動，捨棄這筆");
+    return;
+  }
+
+  if (ok) {
+    mifiHasData = true;
+    mifiLastOkAt = millis();
+    mifiFailCount = 0;
+    Serial.printf("MiFi 電量：電池=%d 分段=%s 插電=%d 充電=%d\n",
+                  mifiBatConnect, mifiBatLevel.c_str(), mifiPowerIn, mifiChargeState);
+  } else {
+    mifiFailCount++;
+    Serial.printf("MiFi：讀取失敗（連續 %d 次）\n", mifiFailCount);
+  }
+  // 讀到過資料才以分享器身分發布（讀失敗也發，讓訂閱端從 valid/age 看出資料變舊）
+  if (mifiHasData) publishMifiStatus();
+
+  // 時間戳在阻塞呼叫之後才取
+  mifiNextPollAt = millis() + ((ok || mifiHasData) ? MIFI_POLL_INTERVAL_MS : MIFI_PROBE_INTERVAL_MS);
+  if (mifiNextPollAt == 0) mifiNextPollAt = 1;  // 0 是哨兵值，避開它
+}
+
+// 分享器的設備 ID：HOBAN-MIFI-{BSSID 大寫去冒號}，例如 HOBAN-MIFI-F8160CB4BC5F（全部大寫，2026-10-04 指定）。
+// 用分享器自己的 MAC 而不是控制器的 ID，換哪台控制器回報都是同一個 ID。
+String mifiDeviceId() {
+  String mac = WiFi.BSSIDstr();
+  mac.replace(":", "");
+  mac.toUpperCase();
+  return "HOBAN-MIFI-" + mac;
+}
+
+// 以分享器自己的身分發布到 hoban/HOBAN-MIFI-{MAC}/status，和控制器平行、不掛在控制器底下。
+// 每次輪詢（約 60 秒）發一則，不跟控制器每 3 秒的狀態走。
+// 同一台分享器下有多台控制器時，每台都會發到同一個 topic，via 標示是誰發的。
+//
+// 刻意「不用 retained」：這個 topic 沒有 LWT，控制器全部離開後沒人能把它改成 offline，
+// age 又是發布當下寫死的值 → 保留訊息會永遠停在 online／valid=true／age=0，
+// 新訂閱端會把幾天前的電量當成即時資料。代價是新訂閱端最多要等 60 秒才收到第一則；
+// 收到就代表「剛剛還有控制器讀到這台分享器」，超過幾分鐘沒收到就視為離線。
+void publishMifiStatus() {
+  if (!mqttClient.connected()) return;
+  String id = mifiDeviceId();
+  String topic = "hoban/" + id + "/status";
+
+  StaticJsonDocument<768> doc;
+  doc["device_id"] = id;
+  doc["model"] = "MiFi";
+  doc["version"] = mifiFwVersion;        // 分享器自己的韌體，例如 JZ10_ZHONGXING_20260123_V1.0.1
+  doc["status"] = "online";
+  doc["ssid"] = WiFi.SSID();
+  doc["ip"] = WiFi.gatewayIP().toString();  // 分享器本身的 IP（管理頁位址）
+  doc["mac"] = WiFi.BSSIDstr();
+  JsonObject battery = doc.createNestedObject("battery");
+  battery["bat"] = mifiBatConnect;      // 0 無電池，1 有
+  battery["level"] = mifiBatLevel;      // 分段字串，例如 ">20"
+  battery["power_in"] = mifiPowerIn;    // 0 沒插電
+  battery["charge"] = mifiChargeState;  // 0 未充電，1 充電中，2 已充滿
+  doc["valid"] = (mifiFailCount < MIFI_STALE_FAILS);
+  doc["age"] = (millis() - mifiLastOkAt) / 1000;
+  doc["via"] = getDeviceId();           // 代為回報的控制器
+  doc["via_version"] = firmwareVersion;  // 該控制器的韌體版本
+  doc["rssi"] = WiFi.RSSI();            // 該控制器收到的分享器訊號
+
+  // SSID 32 bytes、分享器版本字串 40 bytes 時約 470 bytes，加 topic 仍在 setBufferSize(768) 內
+  char buffer[640];
+  size_t len = serializeJson(doc, buffer, sizeof(buffer));
+  bool okPub = mqttClient.publish(topic.c_str(), (const uint8_t*)buffer, len, false);
+  Serial.printf("發布分享器狀態 %s - %s\n", topic.c_str(), okPub ? "成功" : "失敗");
+}
+
+// 控制器自己的 status 只帶「透過哪台分享器上網」的 ID，分享器資料在它自己的 topic
+// （見 publishMifiStatus()）。只有讀到過電量（確定是支援的分享器）才帶。
+void addMifiToStatus(JsonDocument& doc) {
+  if (!mifiHasData) return;
+  doc["mifi_id"] = mifiDeviceId();
 }
 
 // 開機按鈕自檢：短暫取樣兩支按鈕腳，整段都是 LOW 即判定卡住並停用其重置功能
@@ -1539,6 +1898,9 @@ void loop()
     } else {
       mqttClient.loop();
 
+      // 隨身 WiFi 電量（對 WiFi 閘道發 HTTP，內部自帶限頻：讀到過 60 秒、沒讀到過 10 分鐘）
+      pollMifi();
+
       // 每 3 秒發送一次保持連線的狀態更新（帶伺服器資訊）
       if (nowMqtt - lastKeepAlive > 3000) {
         // 用連線當下記下的實際位址，不要從 useCustomServer 反推（見其宣告處的說明）
@@ -1896,6 +2258,7 @@ void publishStatus() {
   // 約多吃 46 bytes —— PubSubClient 的緩衝區設在 512（見 quickConnectToIndex()
   // 的說明），加上去之後這份 JSON 約 250 bytes，還有餘裕，但再加欄位前要重算。
   addBatteryToStatus(doc);
+  addMifiToStatus(doc);
 
   char buffer[1024];  // 將緩衝區大小也增加到 1024
 
@@ -1961,6 +2324,7 @@ void publishStatusWithServer(const char* server) {
   }
 
   addBatteryToStatus(doc);
+  addMifiToStatus(doc);
 
   char buffer[1024];
   serializeJson(doc, buffer);
@@ -2012,7 +2376,8 @@ bool quickConnectToIndex(int index) {
   // 約 200 bytes 加上 topic 35 bytes 就已逼近上限——publish() 會靜默回傳 false，
   // 序列埠卻照印「已發布狀態」。2026-08-16 實測：訂閱 45 秒只收到 3 則，而不是
   // 每 3 秒一則。放大到 512 才夠這份 JSON 用。
-  mqttClient.setBufferSize(512);
+  // 1.10.3 加了 mifi 物件（隨身 WiFi 資訊與電量），最壞整包約 510 bytes，再放大到 768。
+  mqttClient.setBufferSize(768);
 
   unsigned long startTime = millis();
   const char* deviceId = getDeviceId();
@@ -2090,7 +2455,8 @@ bool quickConnectCustom() {
   // 約 200 bytes 加上 topic 35 bytes 就已逼近上限——publish() 會靜默回傳 false，
   // 序列埠卻照印「已發布狀態」。2026-08-16 實測：訂閱 45 秒只收到 3 則，而不是
   // 每 3 秒一則。放大到 512 才夠這份 JSON 用。
-  mqttClient.setBufferSize(512);
+  // 1.10.3 加了 mifi 物件（隨身 WiFi 資訊與電量），最壞整包約 510 bytes，再放大到 768。
+  mqttClient.setBufferSize(768);
 
   unsigned long startTime = millis();
   const char* deviceId = getDeviceId();

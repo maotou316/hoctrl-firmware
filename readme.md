@@ -224,6 +224,74 @@ RESET 按鈕 GPIO 1 內部短路）。副作用：「按住按鈕再上電」會
 
 ## 版本記錄
 
+### 1.11.3
+
+- 分享器 ID 改成全部大寫的 `HOBAN-MIFI-{BSSID 去冒號}`，例如 `HOBAN-MIFI-F8160CB4BC5F`，
+  topic 隨之變成 `hoban/HOBAN-MIFI-F8160CB4BC5F/status`（**與 1.11.1 的 `mifi-f8160cb4bc5f` 不相容；1.11.2 未發佈，直接以 1.11.3 發出**）。
+  控制器 status 的 `mifi_id` 同步改格式
+- 分享器訊息加上 `version`（分享器自己的韌體，取自管理頁 XML 的 `version_num`，實測
+  `JZ10_ZHONGXING_20260123_V1.0.1`；讀不到為空字串）與 `via_version`（代為回報的控制器韌體版本）
+
+### 1.11.1
+
+**隨身 WiFi（分享器）改成獨立設備，不再掛在控制器的 status 底下。**
+
+- 新 topic `hoban/mifi-{BSSID 小寫去冒號}/status`（例如 `hoban/mifi-f8160cb4bc5f/status`），
+  ID 用分享器自己的 MAC，換哪台控制器回報都一樣。欄位：`device_id`、`model:"MiFi"`、`status`、
+  `ssid`、`ip`、`mac`、`battery{bat, level, power_in, charge}`、`valid`、`age`、`via`（代為回報的控制器）、`rssi`
+- **不是 retained**：這個 topic 沒有 LWT，retained 會讓控制器全部離開後的舊電量永遠停在
+  online／valid=true，看起來像即時資料。新訂閱端最多等 60 秒收到第一則
+- 控制器 status 的 `mifi` 物件拿掉，改成只帶 `mifi_id`（**與 1.10.x 不相容**：照 1.10.x 讀
+  `status.mifi` 的訂閱端會讀不到，要改訂閱分享器 topic）
+- 讀取期間（最長約 24 秒）若斷線或換 AP，整筆作廢不發布，避免電量掛到錯的分享器 ID
+- **已知限制**：讀取是同步 HTTP，連著支援的分享器時每 60 秒約有 2 秒 `mqttClient.loop()` 不跑，
+  這段期間 App 的繼電器指令會延後到讀完才動作；重新登入時更久
+
+**實測狀態**：編譯通過；燒錄時 COM4 斷線，尚未實機驗證新 topic。
+
+### 1.10.6
+
+- **修正隨身 WiFi 登入不成立（實機讀到電量的關鍵修正）**：登入請求 `/login.cgi?Action=Digest&...`
+  本身也要帶 `Authorization` header（格式同讀取，nc=00000001），之後讀取從 nc=00000002 起算。
+  原始規格漏了這條，沒帶的話登入照樣回 200，但讀 status1 只拿到
+  `<login_status>UNAUTHORIZED</login_status>`。依據是管理頁 `js/base/ajax_calls.js` 的 `authentication()`
+- **實測（2026-10-04）**：hoban-10b41d4afe30 連 HBTech（realm "Highwmg"，型號 JZ10_ZHONGXING），
+  開機 9 秒讀到 `mifi: {bat:1, level:">20", power_in:0, charge:0, valid:true}`
+
+### 1.10.4
+
+- **修正隨身 WiFi 永遠讀不到電量**：status1 實測要 1.6～1.9 秒才回（realm "Highwmg" 機種，
+  2026-10-04），原本讀取逾時 2 秒，加上 Modem-sleep 的收包延遲就超時。
+  連線逾時維持 2 秒（不支援的設備仍快速失敗），讀取逾時放寬到 8 秒；最壞阻塞約 24 秒
+
+### 1.10.3
+
+- `mifi` 物件加上分享器本身的資訊：`ssid`（WiFi 名稱）、`rssi`（訊號強度）、
+  `ip`（分享器 IP，即閘道）、`mac`（分享器 MAC，即 BSSID）。`ssid`／`rssi` 與 `wifi` 物件重複是刻意的，
+  App 只看 `mifi` 就拿得到全部分享器資料。只有讀到過電量（確定是支援的分享器）才帶
+- MQTT 緩衝區 `setBufferSize()` 由 512 放大到 768（SSID 32 bytes 時整包約 510 bytes）
+
+### 1.10.2
+
+- 隨身 WiFi 狀態回應加 16KB 大小上限，超過就放棄不讀。防不支援的設備（例如攔截網頁的
+  公共 WiFi）對任何網址都回一大頁 HTML、整頁讀進記憶體
+
+### 1.10.1
+
+**連上 LTE 隨身 WiFi 時，讀取隨身 WiFi 自己的電量，放進 status 的 `mifi` 物件。**
+
+- 管理頁位址取「目前 WiFi 的閘道」，不寫死 IP（Marvell/ASR 方案 MiFi，帳密 admin/admin）。
+  任何網路都會試，不是這種機種的第一個請求就失敗、10 分鐘後才再試；換 AP 就清掉舊資料重來
+- 流程：`/login.cgi` 取 Digest challenge → 登入 → `xml_action.cgi?...file=status1` 讀 XML；
+  session 約 10 分鐘逾時會回空 body，找不到 `Battery_connect` 就重新登入再讀一次
+- 讀到過資料：每 60 秒輪詢；從沒讀到過（多半不是這種機種）：10 分鐘才再試
+- HTTP 逾時 2 秒、最壞阻塞約 12 秒，仍在 MQTT keepAlive 之內；OTA 中與按住重置鍵時不輪詢
+- `mifi` 欄位：`bat`（0 無電池／1 有）、`level`（分段字串如 `">20"`，機器不給精確數字）、
+  `power_in`（0 沒插電）、`charge`（0 未充電／1 充電中／2 已充滿）、
+  `valid`（連續失敗 3 次轉 false）、`age`（距上次讀到幾秒）。讀不到時整個物件不帶
+
+**實測狀態**：僅編譯通過（2026-10-04），尚未接實機隨身 WiFi 驗證。
+
 ### 1.9.0
 
 **WiFi 改用 Modem-sleep（`WIFI_PS_MIN_MODEM`），延長電池待機時間。**
