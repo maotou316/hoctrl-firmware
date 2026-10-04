@@ -146,6 +146,32 @@ firmware/{model}/{model}_v{version}.bin
 }
 ```
 
+會寫進兩個 Firebase 專案：`hoctrl`（齁控 App）與 `holucam-be6c6`（**只為舊版 HoLuCam App 保留**）。
+
+### 7. 登記 HoLuCam 後台
+HoLuCam App 與網頁後台現在讀後台 MySQL 的 `FirmwareRelease`，所以每個型號（hoRelay2 與 hoRelay2-1 各一次）還會：
+
+```
+PUT {HOLUCAM_API_BASE}/api/firmware-publish/releases/{model}
+Authorization: Bearer {HOLUCAM_FIRMWARE_PUBLISH_TOKEN}
+{ "version", "downloadUrl", "md5", "minVersion", "changelog" }
+```
+
+| 環境變數 | 說明 |
+|----------|------|
+| `HOLUCAM_FIRMWARE_PUBLISH_TOKEN` | 後台發版 token（機密）。沒設 → 黃色警告「略過 HoLuCam 後台登記」，發版照常完成 |
+| `HOLUCAM_API_BASE` | 後台網址，預設 `https://holucam.neuter.online` |
+
+有設 token 卻登記失敗時會印出後台回的錯誤碼（如 `firmware-publish-disabled`、`invalid-publish-token`、`invalid-body`、`invalid-model`、`invalid-md5`、`url-too-long`）與訊息，結尾列出失敗項並以結束代碼 1 結束。
+
+**部署順序**：先部署 HoLuCam 後台並設定 `FIRMWARE_PUBLISH_TOKEN`，之後才在發版機設定 `HOLUCAM_FIRMWARE_PUBLISH_TOKEN`。反過來的話，發版機有 token、後台卻還沒啟用，登記會回 503 並以結束代碼 1 結束。後台的 `FIRMWARE_PUBLISH_TOKEN` 少於 32 字元會視同未設定（同樣回 503 `firmware-publish-disabled`）。
+
+`HOLUCAM_API_BASE` 必須是 `https://`（只有 `http://localhost`、`http://127.0.0.1` 可用 http）；token 含換行等控制字元也會直接判定失敗，兩者都不會送出 token。
+
+登記失敗時韌體已上傳、Firestore 已寫、`.ino` 版號也已 +1：**不要重跑 publish.py（會再跳一個版號），請到 HoLuCam 後台「韌體管理」頁手動登記。**
+
+`.ino` 的 `deviceModel` 與 `MODEL_CONFIGS` 的 `expected_model` 不符（或與其他型號撞名）時，會在改版號與編譯前就中止，不上傳、不寫 Firestore、不登記後台。
+
 ## 手動上傳步驟（無 gsutil）
 
 如果未安裝 gsutil，需要手動上傳：

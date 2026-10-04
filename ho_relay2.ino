@@ -12,7 +12,7 @@
 #include <WiFiClientSecure.h>  // 添加 WiFiClientSecure 庫
 #include <esp_wifi.h>          // ESP32 WiFi 底層 API（PMF 設定等）
 
-const char* firmwareVersion = "1.9.0"; // 當前韌體版本
+const char* firmwareVersion = "1.9.3"; // 當前韌體版本
 // uPesy ESP32 WROOM DevKit
 // LED 閃爍模式定義
 const unsigned long SHORT_BLINK = 200;  // 短閃持續時間 (毫秒)
