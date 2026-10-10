@@ -12,8 +12,9 @@
 #include <WiFiClientSecure.h>  // 添加 WiFiClientSecure 庫
 #include <esp_wifi.h>          // ESP32 WiFi 底層 API（PMF 設定等）
 #include <MD5Builder.h>         // 隨身 WiFi 管理頁的 HTTP Digest 認證
+#include <base64.h>             // reqproc 方案隨身 WiFi 的登入密碼要 Base64
 
-const char* firmwareVersion = "1.11.4"; // 當前韌體版本
+const char* firmwareVersion = "1.12.1"; // 當前韌體版本
 // uPesy ESP32 WROOM DevKit
 // LED 閃爍模式定義
 const unsigned long SHORT_BLINK = 200;  // 短閃持續時間 (毫秒)
@@ -615,7 +616,7 @@ void addBatteryToStatus(JsonDocument& doc) {
 // HTTP 是阻塞的。連線逾時 2 秒（不支援的設備很快失敗），讀取逾時 8 秒：
 // 實測（2026-10-04，realm "Highwmg" 機種）status1 要 1.6～1.9 秒才回，1.10.3 以前讀取也設 2 秒，
 // 加上 Modem-sleep 的收包延遲就超時，永遠讀不到。最壞一輪（登入 2 次請求 + 讀取，失敗再重登重讀）
-// 約 24 秒，仍在 MQTT keepAlive 30 秒（broker 45 秒才踢）之內。
+// 約 24 秒，仍在 MQTT keepAlive 30 秒（broker 45 秒才踢）之內。reqproc 機種另有 15 秒預算（見下方 reqproc 段）。
 //
 // 認證流程（機器的 Digest 實作有自己的規矩，照抄，不要「修正」成標準 Digest）：
 //   1. GET /login.cgi 取 WWW-Authenticate 的 realm/nonce/qop
@@ -647,6 +648,15 @@ String mifiBatLevel;                  // Battery_voltage：分段字串（例如
 int mifiPowerIn = -1;                 // Battery_charging：0 沒插電
 int mifiChargeState = -1;             // Battery_charge：0 未充電，1 充電中，2 已充滿
 String mifiFwVersion;                 // 分享器自己的韌體版本（sysinfo 的 version_num），讀不到為空
+int mifiBatPercent = -1;              // 機種本身沒給數字、由格數換算的百分比；-1 = 改看 level 是否為純數字
+
+// 管理頁的方案。同一個網路（netKey）認定一次就不再試另一種，換網路時重設
+enum MifiKind { MIFI_KIND_UNKNOWN, MIFI_KIND_ASR, MIFI_KIND_REQPROC };
+MifiKind mifiKind = MIFI_KIND_UNKNOWN;
+unsigned long mifiReqprocLoginAt = 0;  // 上次嘗試 reqproc 登入的時間
+bool mifiReqprocLoginTried = false;    // 這個網路試過登入沒（不拿 LoginAt == 0 當哨兵，millis 繞回會撞上）
+bool mifiRetrySoon = false;            // 登入成功但這輪沒預算重讀：下一輪照一般間隔（60 秒）來讀，免得 session 過期
+bool mifiReqprocLoginBlocked = false;   // 這個網路登入被拒過（密碼不是 admin）：不再試，免得鎖住管理頁
 unsigned long mifiLastOkAt = 0;
 int mifiFailCount = 0;
 unsigned long mifiNextPollAt = 0;     // 0 = 立刻可試
@@ -836,6 +846,7 @@ static bool mifiFetchStatus() {
   xmlTagValue(body, "Battery_voltage", level);
   mifiBatConnect = connect.toInt();
   mifiBatLevel = level;
+  mifiBatPercent = -1;  // ASR 機種的百分比由 level 決定（publish 時判斷）
   mifiPowerIn = xmlTagValue(body, "Battery_charging", charging) ? charging.toInt() : -1;
   mifiChargeState = xmlTagValue(body, "Battery_charge", charge) ? charge.toInt() : -1;
   String fw;
@@ -843,12 +854,145 @@ static bool mifiFetchStatus() {
   return true;
 }
 
-static bool mifiReadOnce() {
+static bool mifiReadAsr() {
   if (!mifiLoggedIn && !mifiLogin()) return false;
   if (mifiFetchStatus()) return true;
   // session 過期或被瀏覽器登入踢掉：重新登入再試一次
   if (!mifiLogin()) return false;
   return mifiFetchStatus();
+}
+
+// ── reqproc 方案（M603SX 等，管理頁 GoAhead「Demo-Webs」，API 是 /reqproc/proc_get）──
+//
+// 實測 M603SX（韌體 M603SX2.6_FI_DANENG_SL_V01.01.02P42U28_02，管理頁 192.168.0.1，2026-10-09）：
+// - GET /reqproc/proc_get?multi_data=1&cmd=a,b,c 回 JSON，不需要 Referer，也沒有 cookie
+// - 電量只有 battery_pers 格數 "0"～"4"（管理頁對應 power_out／one／two／three／full 四格圖示）；
+//   battery_vol_percent 等欄位都是空字串，機器不給百分比也不給電壓 → 百分比用「格數 × 25」換算，
+//   誤差最大約 ±12%。battery_charging "1" = 充電中
+// - 登入：POST /reqproc/proc_post，goformId=LOGIN&password=Base64(密碼)（管理頁 PASSWORD_ENCODE=true），
+//   result "0" 或 "4" 成功。實測時電腦的瀏覽器已登入（loginfo=ok），**沒登入時 battery_pers 是否
+//   照給尚未驗證**，所以只在讀到空值時才登入。這款開了 LOGIN_SECURITY_SUPPORT，密碼錯太多次會把
+//   管理頁鎖住，所以：loginfo 已是 ok 還讀不到（這台本來就不給電量）不登入；被拒一次就在這個網路停手；
+//   其餘 10 分鐘最多試一次
+// - 阻塞預算：一次 pollMifi 之內，前面已花超過 MIFI_REQPROC_BUDGET_MS 就不再發登入／重讀，
+//   最壞約 ASR 探測 10 秒＋GET 10 秒＋登入 10 秒 ≈ 20～30 秒，與 ASR 一輪同級
+const unsigned long MIFI_REQPROC_LOGIN_INTERVAL_MS = 600000;
+const unsigned long MIFI_REQPROC_BUDGET_MS = 15000;
+const size_t MIFI_REQPROC_MAX_BODY = 2048;
+
+// 讀一次 proc_get，解析成功（是 JSON 物件）才回 true
+static bool mifiReqprocGet(JsonDocument& doc) {
+  WiFiClient client;
+  HTTPClient http;
+  http.setConnectTimeout(MIFI_CONNECT_TIMEOUT_MS);
+  http.setTimeout(MIFI_READ_TIMEOUT_MS);
+  String url = mifiHost + "/reqproc/proc_get?multi_data=1&cmd=battery_pers,battery_charging,loginfo,wa_inner_version";
+  if (!http.begin(client, url)) return false;
+  int code = http.GET();
+  String body;
+  if (code == 200) {
+    int size = http.getSize();
+    if (size <= (int)MIFI_REQPROC_MAX_BODY) {
+      CappedStringStream sink(body, MIFI_REQPROC_MAX_BODY);
+      if (http.writeToStream(&sink) < 0) body = "";
+    }
+  }
+  http.end();
+  if (body.length() == 0) return false;
+  if (deserializeJson(doc, body) != DeserializationError::Ok) return false;
+  return doc.is<JsonObject>();
+}
+
+static bool mifiReqprocLogin() {
+  WiFiClient client;
+  HTTPClient http;
+  http.setConnectTimeout(MIFI_CONNECT_TIMEOUT_MS);
+  http.setTimeout(MIFI_READ_TIMEOUT_MS);
+  if (!http.begin(client, mifiHost + "/reqproc/proc_post")) return false;
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+  int code = http.POST("goformId=LOGIN&password=" + urlEncode(base64::encode(MIFI_PASS)));
+  String body;
+  if (code == 200 && http.getSize() <= (int)MIFI_REQPROC_MAX_BODY) {
+    CappedStringStream sink(body, MIFI_REQPROC_MAX_BODY);  // getSize() == -1（chunked）也要擋上限
+    if (http.writeToStream(&sink) < 0) body = "";
+  }
+  http.end();
+  StaticJsonDocument<128> doc;
+  if (deserializeJson(doc, body) != DeserializationError::Ok) {
+    Serial.printf("MiFi(reqproc)：登入沒有回應（HTTP %d）\n", code);
+    return false;  // 網路問題，不算被拒，之後照間隔再試
+  }
+  const String res = doc["result"].as<String>();  // 字串或數字都收
+  const bool ok = res == "0" || res == "4";
+  if (!ok) mifiReqprocLoginBlocked = true;  // 密碼被拒：這個網路不再試，免得累積錯誤次數鎖住管理頁
+  Serial.printf("MiFi(reqproc)：登入%s（result %s）\n", ok ? "成功" : "被拒，這個網路不再嘗試", res.c_str());
+  return ok;
+}
+
+// battery_pers 必須是 0～4（字串或數字都收），否則視為沒讀到（空字串＝多半是沒登入）
+static int reqprocBars(JsonDocument& doc) {
+  JsonVariant v = doc["battery_pers"];
+  if (v.is<int>()) {
+    int n = v.as<int>();
+    return (n >= 0 && n <= 4) ? n : -1;
+  }
+  const char* p = v | "";
+  if (strlen(p) != 1 || p[0] < '0' || p[0] > '4') return -1;
+  return p[0] - '0';
+}
+
+static bool mifiReadReqproc(unsigned long startedAt) {
+  StaticJsonDocument<512> doc;
+  if (!mifiReqprocGet(doc)) return false;  // 不是這種機種：404 或不是 JSON
+  int bars = reqprocBars(doc);
+  if (bars < 0) {
+    // 已登入還讀不到 → 這台本來就不給電量（家用 4G 路由器等），登入也沒用，別去累積錯誤次數
+    const char* loginfo = doc["loginfo"] | "";
+    if (strcmp(loginfo, "ok") == 0 || mifiReqprocLoginBlocked) return false;
+    if (mifiReqprocLoginTried && millis() - mifiReqprocLoginAt < MIFI_REQPROC_LOGIN_INTERVAL_MS) return false;
+    if (millis() - startedAt > MIFI_REQPROC_BUDGET_MS) return false;  // 這輪已經阻塞太久，下一輪再登入
+    mifiReqprocLoginTried = true;
+    mifiReqprocLoginAt = millis();
+    if (!mifiReqprocLogin()) return false;
+    if (millis() - startedAt > MIFI_REQPROC_BUDGET_MS) {  // 登入花太久，重讀留給下一輪
+      mifiRetrySoon = true;
+      return false;
+    }
+    doc.clear();
+    if (!mifiReqprocGet(doc)) return false;
+    bars = reqprocBars(doc);
+    if (bars < 0) return false;
+  }
+  const char* charging = doc["battery_charging"] | "";
+  const bool isCharging = strcmp(charging, "1") == 0;
+  mifiBatConnect = 1;
+  mifiBatLevel = String(bars) + "/4";  // 原始格數，非純數字 → publish 不會把它當百分比
+  mifiBatPercent = bars * 25;
+  // battery_charging 是「正在充電」，不是 ASR 的「有沒有插電」：插著電但已充滿時是 0，
+  // 照抄會被當成沒插電。只有充電中能確定有插電，其餘填 -1（未知）
+  mifiPowerIn = isCharging ? 1 : -1;
+  mifiChargeState = isCharging ? 1 : 0;  // 這款不區分「已充滿」
+  mifiFwVersion = String(doc["wa_inner_version"] | "");
+  return true;
+}
+
+// 依機種分派。還沒認定機種時先試 ASR（不是 ASR 的機器 /login.cgi 會很快 404），再試 reqproc
+static bool mifiReadOnce() {
+  const unsigned long startedAt = millis();
+  if (mifiKind != MIFI_KIND_REQPROC) {
+    if (mifiReadAsr()) {
+      mifiKind = MIFI_KIND_ASR;
+      return true;
+    }
+    if (mifiKind == MIFI_KIND_ASR) return false;
+  }
+  // ASR 那段失敗可能已阻塞到 24 秒（登入＋讀取＋重登＋重讀），再發 reqproc 會超過 MQTT keepAlive
+  if (mifiKind == MIFI_KIND_UNKNOWN && millis() - startedAt > MIFI_REQPROC_BUDGET_MS) return false;
+  if (mifiReadReqproc(startedAt)) {
+    mifiKind = MIFI_KIND_REQPROC;
+    return true;
+  }
+  return false;
 }
 
 void pollMifi() {
@@ -867,6 +1011,11 @@ void pollMifi() {
     mifiLoggedIn = false;
     mifiFailCount = 0;
     mifiNextPollAt = 0;
+    mifiKind = MIFI_KIND_UNKNOWN;
+    mifiReqprocLoginAt = 0;
+    mifiReqprocLoginTried = false;
+    mifiReqprocLoginBlocked = false;
+    mifiBatPercent = -1;
   }
 
   if (mifiNextPollAt != 0 && (long)(millis() - mifiNextPollAt) < 0) return;
@@ -886,8 +1035,9 @@ void pollMifi() {
     mifiHasData = true;
     mifiLastOkAt = millis();
     mifiFailCount = 0;
-    Serial.printf("MiFi 電量：電池=%d 分段=%s 插電=%d 充電=%d\n",
-                  mifiBatConnect, mifiBatLevel.c_str(), mifiPowerIn, mifiChargeState);
+    Serial.printf("MiFi 電量（%s）：電池=%d 分段=%s 百分比=%d 插電=%d 充電=%d\n",
+                  mifiKind == MIFI_KIND_REQPROC ? "reqproc" : "ASR",
+                  mifiBatConnect, mifiBatLevel.c_str(), mifiBatPercent, mifiPowerIn, mifiChargeState);
   } else {
     mifiFailCount++;
     Serial.printf("MiFi：讀取失敗（連續 %d 次）\n", mifiFailCount);
@@ -896,7 +1046,8 @@ void pollMifi() {
   if (mifiHasData) publishMifiStatus();
 
   // 時間戳在阻塞呼叫之後才取
-  mifiNextPollAt = millis() + ((ok || mifiHasData) ? MIFI_POLL_INTERVAL_MS : MIFI_PROBE_INTERVAL_MS);
+  mifiNextPollAt = millis() + ((ok || mifiHasData || mifiRetrySoon) ? MIFI_POLL_INTERVAL_MS : MIFI_PROBE_INTERVAL_MS);
+  mifiRetrySoon = false;
   if (mifiNextPollAt == 0) mifiNextPollAt = 1;  // 0 是哨兵值，避開它
 }
 
@@ -932,8 +1083,21 @@ void publishMifiStatus() {
   doc["mac"] = WiFi.BSSIDstr();
   JsonObject battery = doc.createNestedObject("battery");
   battery["bat"] = mifiBatConnect;      // 0 無電池，1 有
-  battery["level"] = mifiBatLevel;      // 分段字串，例如 ">20"
-  battery["power_in"] = mifiPowerIn;    // 0 沒插電
+  battery["level"] = mifiBatLevel;      // 分享器原始字串：分段（如 ">20"）、數字（如 "70"）或格數（如 "3/4"）
+  // level 是純數字（MF808_HP 這類機種給的是精確百分比）才另外帶 percent；
+  // reqproc 機種（M603SX）由格數 × 25 換算；分段值（JZ10_ZHONGXING 的 ">20"）換算不出數字，就不帶，訂閱端要容忍缺席
+  if (mifiBatPercent >= 0) {
+    battery["percent"] = mifiBatPercent;
+  } else if (mifiBatLevel.length() > 0 && mifiBatLevel.length() <= 3) {
+    bool digits = true;
+    for (size_t i = 0; i < mifiBatLevel.length(); i++) {
+      if (!isdigit((unsigned char)mifiBatLevel[i])) { digits = false; break; }
+    }
+    if (digits && mifiBatLevel.toInt() <= 100) battery["percent"] = mifiBatLevel.toInt();
+  }
+  // power_in 原樣轉發 Battery_charging，各機種定義不同（MF808_HP 出現過規格外的 3，
+  // 它的管理頁也不看這欄），判斷充電狀態請看 charge
+  battery["power_in"] = mifiPowerIn;
   battery["charge"] = mifiChargeState;  // 0 未充電，1 充電中，2 已充滿
   doc["valid"] = (mifiFailCount < MIFI_STALE_FAILS);
   doc["age"] = (millis() - mifiLastOkAt) / 1000;

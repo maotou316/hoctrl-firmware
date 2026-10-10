@@ -224,6 +224,30 @@ RESET 按鈕 GPIO 1 內部短路）。副作用：「按住按鈕再上電」會
 
 ## 版本記錄
 
+### 1.12.0
+
+- 隨身 WiFi 支援第二種管理頁方案 **reqproc**（GoAhead「Demo-Webs」，API `/reqproc/proc_get`）。
+  同一個網路先試 ASR（`/login.cgi`），不是再試 reqproc，認定後不再試另一種，換網路重新判斷
+- 實測 M603SX（韌體 `M603SX2.6_FI_DANENG_SL_V01.01.02P42U28_02`，管理頁 192.168.0.1，2026-10-09）：
+  - 電量只有 `battery_pers` 格數 `"0"`～`"4"`，`battery_vol_percent` 等欄位都是空的 →
+    `percent` 用「格數 × 25」換算（誤差最大約 ±12%），`level` 帶原始格數（例 `"3/4"`）
+  - `battery_charging` `"1"` = 充電中 → `charge` 1、`power_in` 1；不在充電時 `power_in` 送 -1（未知）——
+    它的意思是「正在充電」不是 ASR 的「有沒有插電」，充滿時是 0，照抄會誤報沒插電。這款不區分「已充滿」
+  - 讀取不需要 Referer。實測時電腦瀏覽器已登入，**未登入能否讀到格數尚未驗證**：
+    讀到空值才 `POST /reqproc/proc_post goformId=LOGIN&password=Base64(admin)`。這款開了
+    LOGIN_SECURITY_SUPPORT（連續打錯密碼會鎖管理頁），所以 `loginfo` 已是 ok 仍讀不到就不登入、
+    被拒一次就在這個網路停手、其餘 10 分鐘最多一次；一輪阻塞超過 15 秒就不再登入／重讀，留給下一輪
+
+### 1.11.5
+
+- 分享器訊息的 `battery` 加上 `percent`（整數）：`level` 是純數字時才帶，分段值（如 `">20"`）不帶
+- 實測兩種 ASR 方案機種（2026-10-07）：
+  - JZ10_ZHONGXING（硬體 NZ_SSG_V20，管理頁 192.168.100.1）：`Battery_voltage` 只給分段 `">20"`。
+    `Engineer_parameter`、`device_management` 都沒有更細的電池資料，只開 53／80 port，沒有其他管道
+  - MF808_HP（韌體 MF808_HP_V51_SER_DE_LA_260116_CN，管理頁 192.168.0.1）：`Battery_voltage` 給精確百分比
+    `"70"`；`Battery_charging` 出現規格外的 3，它的管理頁只看 `Battery_charge` 判斷充電
+- `power_in` 維持原樣轉發，文件註明各機種定義不同、判斷充電要看 `charge`
+
 ### 1.11.3
 
 - 分享器 ID 改成全部大寫的 `HOBAN-MIFI-{BSSID 去冒號}`，例如 `HOBAN-MIFI-F8160CB4BC5F`，
