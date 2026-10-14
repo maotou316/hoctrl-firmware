@@ -14,7 +14,7 @@
 #include <MD5Builder.h>         // 隨身 WiFi 管理頁的 HTTP Digest 認證
 #include <base64.h>             // reqproc 方案隨身 WiFi 的登入密碼要 Base64
 
-const char* firmwareVersion = "1.12.1"; // 當前韌體版本
+const char* firmwareVersion = "1.12.3"; // 當前韌體版本
 // uPesy ESP32 WROOM DevKit
 // LED 閃爍模式定義
 const unsigned long SHORT_BLINK = 200;  // 短閃持續時間 (毫秒)

@@ -32,7 +32,11 @@
 Set-Location A:\project\hoctrl_arduino
 .\flash.ps1 -Model 2            # 只編譯
 .\flash.ps1 -Model 2 -Upload    # 編譯並燒錄（自動偵測 COM 埠）
+.\flash.ps1 -Model 2 -Upload -SkipCompile   # 量產多張板子：沿用上次編譯結果直接燒
 ```
+
+量產時先編譯一次，之後每換一張板子就跑 `-SkipCompile`。設備 ID 取自晶片 MAC，同一份 bin 通用；
+若 `.ino` 在編譯後又被改過，腳本會印紅字警告。
 
 `-Model` 的合法值是 `1,2,3,master,master-c3,slave,test`，**hoRelay2 對應 `2`**。
 腳本預設 `EraseFlash=all`，燒完 EEPROM 一併被抹掉，**需重新透過 BLE 配網**。
