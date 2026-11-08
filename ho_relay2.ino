@@ -14,7 +14,7 @@
 #include <MD5Builder.h>         // 隨身 WiFi 管理頁的 HTTP Digest 認證
 #include <base64.h>             // reqproc 方案隨身 WiFi 的登入密碼要 Base64
 
-const char* firmwareVersion = "1.12.3"; // 當前韌體版本
+const char* firmwareVersion = "1.12.4"; // 當前韌體版本
 // uPesy ESP32 WROOM DevKit
 // LED 閃爍模式定義
 const unsigned long SHORT_BLINK = 200;  // 短閃持續時間 (毫秒)
@@ -651,12 +651,19 @@ String mifiFwVersion;                 // 分享器自己的韌體版本（sysinf
 int mifiBatPercent = -1;              // 機種本身沒給數字、由格數換算的百分比；-1 = 改看 level 是否為純數字
 
 // 管理頁的方案。同一個網路（netKey）認定一次就不再試另一種，換網路時重設
-enum MifiKind { MIFI_KIND_UNKNOWN, MIFI_KIND_ASR, MIFI_KIND_REQPROC };
+enum MifiKind { MIFI_KIND_UNKNOWN, MIFI_KIND_ASR, MIFI_KIND_REQPROC, MIFI_KIND_HBAPI };
 MifiKind mifiKind = MIFI_KIND_UNKNOWN;
 unsigned long mifiReqprocLoginAt = 0;  // 上次嘗試 reqproc 登入的時間
 bool mifiReqprocLoginTried = false;    // 這個網路試過登入沒（不拿 LoginAt == 0 當哨兵，millis 繞回會撞上）
 bool mifiRetrySoon = false;            // 登入成功但這輪沒預算重讀：下一輪照一般間隔（60 秒）來讀，免得 session 過期
 bool mifiReqprocLoginBlocked = false;   // 這個網路登入被拒過（密碼不是 admin）：不再試，免得鎖住管理頁
+// 行動網路狀態（目前只有 hbapi 機種會填；mifiCellMode 空字串 = 沒有，publish 不帶 cell 物件）
+String mifiCellMode;                  // 例如 "LTE"、"No Service"
+String mifiCellOperator;              // 電信業者（spn）
+int mifiCellSignal = -1;              // 訊號格數（管理頁的訊號圖示）
+int mifiCellSim = -1;                 // 1 = SIM 正常
+int mifiCellInternet = -1;            // 1 = 已連上網際網路
+bool mifiHbapiInfoDone = false;       // 這個網路讀過 system_getdeviceinfo（韌體版本）沒
 unsigned long mifiLastOkAt = 0;
 int mifiFailCount = 0;
 unsigned long mifiNextPollAt = 0;     // 0 = 立刻可試
@@ -976,9 +983,81 @@ static bool mifiReadReqproc(unsigned long startedAt) {
   return true;
 }
 
-// 依機種分派。還沒認定機種時先試 ASR（不是 ASR 的機器 /login.cgi 會很快 404），再試 reqproc
+// ── hbapi 方案（HB5410I 等，管理頁是 Vue 單頁應用，API 是 POST /hbapi-json）──
+//
+// 實測 HB5410I_V1.1（韌體 HI1_A11_CE0_S02_V05_260206，管理頁 192.168.100.1，2026-11-08）：
+// - POST /hbapi-json，body {"params":[sid, "system", 方法, {"param1":"null"}]}，回 {"result":"ok","params":{...}}
+// - system_getallstatus 與 system_getdeviceinfo **不用登入**（sid 給空字串），管理頁登入前就在呼叫
+// - getallstatus：batteryLevel（數字百分比）、batteryStatus（"charging" 充電中、"disable" 沒有電池，
+//   管理頁遇到 disable 會整個隱藏電池圖示；放電中的值要接有電池的機種才看得到）、
+//   mode、signal（格數）、spn、simstate、internet
+// - 實測那台沒有電池（batteryStatus "disable"、getnetoverview 的 battery "-1"），batteryLevel 的 100 是預設值
+// - getdeviceinfo 會回 IMEI，只取 swver，不要把其他欄位帶進 MQTT（公共 broker）
+const size_t MIFI_HBAPI_MAX_BODY = 1024;
+
+// 呼叫一個 hbapi 方法，result 是 "ok" 才回 true，doc 內是整份回應
+static bool mifiHbapiCall(const char* method, JsonDocument& doc) {
+  WiFiClient client;
+  HTTPClient http;
+  http.setConnectTimeout(MIFI_CONNECT_TIMEOUT_MS);
+  http.setTimeout(MIFI_READ_TIMEOUT_MS);
+  if (!http.begin(client, mifiHost + "/hbapi-json")) return false;
+  http.addHeader("Content-Type", "application/json");
+  int code = http.POST(String("{\"params\":[\"\",\"system\",\"") + method + "\",{\"param1\":\"null\"}]}");
+  String body;
+  if (code == 200 && http.getSize() <= (int)MIFI_HBAPI_MAX_BODY) {
+    CappedStringStream sink(body, MIFI_HBAPI_MAX_BODY);  // getSize() == -1（chunked）也要擋上限
+    if (http.writeToStream(&sink) < 0) body = "";
+  }
+  http.end();
+  if (body.length() == 0) return false;
+  if (deserializeJson(doc, body) != DeserializationError::Ok) return false;
+  return strcmp(doc["result"] | "", "ok") == 0;
+}
+
+static bool mifiReadHbapi() {
+  StaticJsonDocument<768> doc;
+  if (!mifiHbapiCall("system_getallstatus", doc)) return false;  // 不是這種機種：404 或不是 JSON
+  JsonObject p = doc["params"];
+  if (p.isNull() || !p.containsKey("batteryStatus")) return false;
+
+  const char* status = p["batteryStatus"] | "";
+  if (strcmp(status, "disable") == 0) {
+    // 沒有電池：batteryLevel 是預設值，不採用；仍回報行動網路狀態
+    mifiBatConnect = 0;
+    mifiBatLevel = "";
+    mifiBatPercent = -1;
+    mifiPowerIn = -1;
+    mifiChargeState = -1;
+  } else {
+    const int lv = p["batteryLevel"] | -1;
+    const bool isCharging = strcmp(status, "charging") == 0;
+    mifiBatConnect = 1;
+    mifiBatLevel = lv >= 0 ? String(lv) : String();
+    mifiBatPercent = (lv >= 0 && lv <= 100) ? lv : -1;
+    // 與 reqproc 同理：只有「充電中」能確定有插電，其餘未知
+    mifiPowerIn = isCharging ? 1 : -1;
+    mifiChargeState = isCharging ? 1 : 0;  // 這款不區分「已充滿」
+  }
+  mifiCellMode = String(p["mode"] | "");
+  mifiCellOperator = String(p["spn"] | "");
+  mifiCellSignal = p["signal"] | -1;
+  mifiCellSim = p["simstate"] | -1;
+  mifiCellInternet = p["internet"] | -1;
+
+  // 韌體版本每個網路讀一次就好；失敗不影響這筆電量
+  if (!mifiHbapiInfoDone) {
+    mifiHbapiInfoDone = true;
+    doc.clear();
+    if (mifiHbapiCall("system_getdeviceinfo", doc)) mifiFwVersion = String(doc["params"]["swver"] | "");
+  }
+  return true;
+}
+
+// 依機種分派。還沒認定機種時先試 ASR（不是 ASR 的機器 /login.cgi 會很快 404），再試 reqproc，最後 hbapi
 static bool mifiReadOnce() {
   const unsigned long startedAt = millis();
+  if (mifiKind == MIFI_KIND_HBAPI) return mifiReadHbapi();
   if (mifiKind != MIFI_KIND_REQPROC) {
     if (mifiReadAsr()) {
       mifiKind = MIFI_KIND_ASR;
@@ -990,6 +1069,13 @@ static bool mifiReadOnce() {
   if (mifiKind == MIFI_KIND_UNKNOWN && millis() - startedAt > MIFI_REQPROC_BUDGET_MS) return false;
   if (mifiReadReqproc(startedAt)) {
     mifiKind = MIFI_KIND_REQPROC;
+    return true;
+  }
+  if (mifiKind == MIFI_KIND_REQPROC) return false;
+  // hbapi 只要一個 POST、不用登入，但前面兩種探測若已阻塞太久，留到下一輪
+  if (millis() - startedAt > MIFI_REQPROC_BUDGET_MS) return false;
+  if (mifiReadHbapi()) {
+    mifiKind = MIFI_KIND_HBAPI;
     return true;
   }
   return false;
@@ -1016,6 +1102,9 @@ void pollMifi() {
     mifiReqprocLoginTried = false;
     mifiReqprocLoginBlocked = false;
     mifiBatPercent = -1;
+    mifiCellMode = "";
+    mifiHbapiInfoDone = false;
+    mifiFwVersion = "";
   }
 
   if (mifiNextPollAt != 0 && (long)(millis() - mifiNextPollAt) < 0) return;
@@ -1036,7 +1125,7 @@ void pollMifi() {
     mifiLastOkAt = millis();
     mifiFailCount = 0;
     Serial.printf("MiFi 電量（%s）：電池=%d 分段=%s 百分比=%d 插電=%d 充電=%d\n",
-                  mifiKind == MIFI_KIND_REQPROC ? "reqproc" : "ASR",
+                  mifiKind == MIFI_KIND_REQPROC ? "reqproc" : mifiKind == MIFI_KIND_HBAPI ? "hbapi" : "ASR",
                   mifiBatConnect, mifiBatLevel.c_str(), mifiBatPercent, mifiPowerIn, mifiChargeState);
   } else {
     mifiFailCount++;
@@ -1083,30 +1172,41 @@ void publishMifiStatus() {
   doc["mac"] = WiFi.BSSIDstr();
   JsonObject battery = doc.createNestedObject("battery");
   battery["bat"] = mifiBatConnect;      // 0 無電池，1 有
-  battery["level"] = mifiBatLevel;      // 分享器原始字串：分段（如 ">20"）、數字（如 "70"）或格數（如 "3/4"）
-  // level 是純數字（MF808_HP 這類機種給的是精確百分比）才另外帶 percent；
-  // reqproc 機種（M603SX）由格數 × 25 換算；分段值（JZ10_ZHONGXING 的 ">20"）換算不出數字，就不帶，訂閱端要容忍缺席
-  if (mifiBatPercent >= 0) {
-    battery["percent"] = mifiBatPercent;
-  } else if (mifiBatLevel.length() > 0 && mifiBatLevel.length() <= 3) {
-    bool digits = true;
-    for (size_t i = 0; i < mifiBatLevel.length(); i++) {
-      if (!isdigit((unsigned char)mifiBatLevel[i])) { digits = false; break; }
+  if (mifiBatConnect == 1) {
+    battery["level"] = mifiBatLevel;      // 分享器原始字串：分段（如 ">20"）、數字（如 "70"）或格數（如 "3/4"）
+    // level 是純數字（MF808_HP 這類機種給的是精確百分比）才另外帶 percent；
+    // reqproc 機種（M603SX）由格數 × 25 換算；分段值（JZ10_ZHONGXING 的 ">20"）換算不出數字，就不帶，訂閱端要容忍缺席
+    if (mifiBatPercent >= 0) {
+      battery["percent"] = mifiBatPercent;
+    } else if (mifiBatLevel.length() > 0 && mifiBatLevel.length() <= 3) {
+      bool digits = true;
+      for (size_t i = 0; i < mifiBatLevel.length(); i++) {
+        if (!isdigit((unsigned char)mifiBatLevel[i])) { digits = false; break; }
+      }
+      if (digits && mifiBatLevel.toInt() <= 100) battery["percent"] = mifiBatLevel.toInt();
     }
-    if (digits && mifiBatLevel.toInt() <= 100) battery["percent"] = mifiBatLevel.toInt();
+    // power_in 原樣轉發 Battery_charging，各機種定義不同（MF808_HP 出現過規格外的 3，
+    // 它的管理頁也不看這欄），判斷充電狀態請看 charge
+    battery["power_in"] = mifiPowerIn;
+    battery["charge"] = mifiChargeState;  // 0 未充電，1 充電中，2 已充滿
+  }  // 沒有電池（bat 0）時其他電池欄位都沒意義，不帶
+  if (mifiCellMode.length() > 0) {
+    // 行動網路狀態，目前只有 hbapi 機種會帶；訂閱端要容忍缺席
+    JsonObject cell = doc.createNestedObject("cell");
+    cell["mode"] = mifiCellMode;          // 例如 "LTE"、"No Service"
+    cell["operator"] = mifiCellOperator;  // 電信業者
+    cell["signal"] = mifiCellSignal;      // 訊號格數
+    cell["sim"] = mifiCellSim;            // 1 = SIM 正常
+    cell["internet"] = mifiCellInternet;  // 1 = 已連上網際網路
   }
-  // power_in 原樣轉發 Battery_charging，各機種定義不同（MF808_HP 出現過規格外的 3，
-  // 它的管理頁也不看這欄），判斷充電狀態請看 charge
-  battery["power_in"] = mifiPowerIn;
-  battery["charge"] = mifiChargeState;  // 0 未充電，1 充電中，2 已充滿
   doc["valid"] = (mifiFailCount < MIFI_STALE_FAILS);
   doc["age"] = (millis() - mifiLastOkAt) / 1000;
   doc["via"] = getDeviceId();           // 代為回報的控制器
   doc["via_version"] = firmwareVersion;  // 該控制器的韌體版本
   doc["rssi"] = WiFi.RSSI();            // 該控制器收到的分享器訊號
 
-  // SSID 32 bytes、分享器版本字串 40 bytes 時約 470 bytes，加 topic 仍在 setBufferSize(768) 內
-  char buffer[640];
+  // SSID 32 bytes、分享器版本字串 40 bytes、再加 cell 物件約 560 bytes，加 topic 仍在 setBufferSize(768) 內
+  char buffer[700];
   size_t len = serializeJson(doc, buffer, sizeof(buffer));
   bool okPub = mqttClient.publish(topic.c_str(), (const uint8_t*)buffer, len, false);
   Serial.printf("發布分享器狀態 %s - %s\n", topic.c_str(), okPub ? "成功" : "失敗");

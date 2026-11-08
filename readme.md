@@ -228,6 +228,19 @@ RESET 按鈕 GPIO 1 內部短路）。副作用：「按住按鈕再上電」會
 
 ## 版本記錄
 
+### 1.12.4
+
+- 隨身 WiFi 支援第三種管理頁方案 **hbapi**（Vue 單頁應用，API 是 `POST /hbapi-json`）。
+  偵測順序 ASR → reqproc → hbapi，前兩種在這類機器上約 0.02 秒就回 404
+- 實測 HB5410I_V1.1（韌體 `HI1_A11_CE0_S02_V05_260206`，管理頁 192.168.100.1，2026-11-08）：
+  - `system_getallstatus`、`system_getdeviceinfo` **不用登入**（sid 給空字串），管理頁登入前就在呼叫
+  - 電量：`batteryLevel` 數字百分比、`batteryStatus`（`"charging"` 充電中、`"disable"` 沒有電池）。
+    那台沒有電池（`disable`，`getnetoverview` 的 battery 也是 `-1`），`batteryLevel` 的 100 只是預設值
+  - 版本取 `getdeviceinfo` 的 `swver`；它也會回 IMEI，刻意不帶進 MQTT
+- 分享器訊息新增 `cell` 物件（目前只有 hbapi 機種）：`mode`、`operator`、`signal`（格數）、`sim`、`internet`
+- `battery.bat` 為 0（沒有電池）時，`battery` 只帶 `bat`，不再送無意義的 `level`／`power_in`／`charge`
+- **實測狀態**：電腦端照韌體的請求格式打過 HB5410I 確認回應；韌體只編譯通過，尚未燒進控制器實測
+
 ### 1.12.0
 
 - 隨身 WiFi 支援第二種管理頁方案 **reqproc**（GoAhead「Demo-Webs」，API `/reqproc/proc_get`）。
